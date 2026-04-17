@@ -31,17 +31,16 @@ python tools/make_yolo_crops_from_panoramax.py \
 """
 
 import argparse
-import io
 import json
 import math
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Set
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
 import requests
-from PIL import Image, ImageOps
 
 
 # -------------------------
@@ -249,6 +248,27 @@ def request_get_with_retry(session: requests.Session, url: str, timeout: int, ma
             time.sleep(0.6 * (2 ** i))
     raise RuntimeError(f"GET failed after retries: {url} ({last_err})")
 
+def infer_image_ext(img_url: str, content_type: str = "") -> str:
+    path = urlparse(img_url).path.lower()
+    suf = Path(path).suffix.lower()
+    if suf in [".jpg", ".jpeg", ".png", ".webp"]:
+        return suf
+
+    content_type = safe_str(content_type).lower().split(";", 1)[0].strip()
+    if content_type == "image/jpeg":
+        return ".jpg"
+    if content_type == "image/png":
+        return ".png"
+    if content_type == "image/webp":
+        return ".webp"
+    return ".jpg"
+
+def download_image_bytes(session: requests.Session, img_url: str, timeout: int = 60) -> Tuple[bytes, str]:
+    r = request_get_with_retry(session, img_url, timeout=timeout, max_tries=4)
+    img_bytes = r.content
+    ext = infer_image_ext(img_url, r.headers.get("Content-Type", ""))
+    return img_bytes, ext
+
 def resolve_image_url_via_item(
     session: requests.Session,
     item_url: str,
@@ -294,18 +314,20 @@ def resolve_image_url_via_item(
                         return out
     return None
 
-def download_image(session: requests.Session, img_url: str, timeout: int = 60) -> Image.Image:
-    r = request_get_with_retry(session, img_url, timeout=timeout, max_tries=4)
-    img = Image.open(io.BytesIO(r.content))
-    img = ImageOps.exif_transpose(img).convert("RGB")
-    return img
-
 def find_pano_path(panos_dir: Path, fid: str) -> Optional[Path]:
     for ext in [".jpg", ".jpeg", ".png", ".webp"]:
         p = panos_dir / f"{fid}{ext}"
         if p.exists():
             return p
     return None
+
+def find_all_pano_paths(panos_dir: Path, fid: str) -> List[Path]:
+    out: List[Path] = []
+    for ext in [".jpg", ".jpeg", ".png", ".webp"]:
+        p = panos_dir / f"{fid}{ext}"
+        if p.exists():
+            out.append(p)
+    return out
 
 
 # -------------------------
@@ -572,11 +594,11 @@ def _fmt_deg_tag(x: float, ndigits: int = 0) -> str:
     frac = v % scale
     return f"{sign}{whole}p{frac}"
 
-def build_crop_name(idx: int, fid: str, view: str, yaw: float, fov: float) -> str:
+def build_crop_name(idx: int, fid: str, view: str, yaw: float, fov: float, ext: str = "jpg") -> str:
     return (
         f"{idx:05d}__{fid}__{view}"
         f"__yaw{_fmt_deg_tag(yaw)}"
-        f"__fov{_fmt_deg_tag(fov)}.jpg"
+        f"__fov{_fmt_deg_tag(fov)}.{ext}"
     )
 
 def wrap_yaw_deg(y: float) -> float:
@@ -791,6 +813,8 @@ def main():
     ap.add_argument("--timeout", type=int, default=60)
     ap.add_argument("--skip_existing", action="store_true")
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--crop_format", choices=["jpg", "png"], default="jpg")
+    ap.add_argument("--crop_jpeg_quality", type=int, default=95)
 
     args = ap.parse_args()
 
@@ -846,8 +870,8 @@ def main():
             fail_dl += 1
             continue
 
-        pano_path = panos_dir / f"{fid}.jpg"
-        if args.skip_existing and pano_path.exists() and pano_path.stat().st_size > 20_000:
+        existing_pano_path = find_pano_path(panos_dir, fid)
+        if args.skip_existing and existing_pano_path and existing_pano_path.stat().st_size > 20_000:
             skip_dl += 1
             continue
 
@@ -868,8 +892,12 @@ def main():
                     raise RuntimeError("cannot resolve image url via item")
                 img_url = normalize_url(resolved)
 
-            img = download_image(session, img_url, timeout=args.timeout)
-            img.save(pano_path, quality=92)
+            img_bytes, pano_ext = download_image_bytes(session, img_url, timeout=args.timeout)
+            pano_path = panos_dir / f"{fid}{pano_ext}"
+            for old_path in find_all_pano_paths(panos_dir, fid):
+                if old_path != pano_path:
+                    old_path.unlink()
+            pano_path.write_bytes(img_bytes)
             ok_dl += 1
 
             if args.sleep > 0:
@@ -971,9 +999,17 @@ def main():
                 view=view_name,
                 yaw=yaw,
                 fov=fov,
+                ext=args.crop_format,
             )
             crop_path = unique_path(crops_dir / crop_name, overwrite=args.overwrite)
-            ok = cv2.imwrite(str(crop_path), crop)
+            if args.crop_format == "png":
+                ok = cv2.imwrite(str(crop_path), crop)
+            else:
+                ok = cv2.imwrite(
+                    str(crop_path),
+                    crop,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), int(args.crop_jpeg_quality)],
+                )
 
             append_jsonl(crop_log_path, {
                 "step": "crop",
@@ -1012,6 +1048,8 @@ def main():
             "pitch_deg": float(pitch_deg),
             "det_w": int(args.det_w),
             "det_h": int(args.det_h),
+            "crop_format": args.crop_format,
+            "crop_jpeg_quality": int(args.crop_jpeg_quality),
             "fov_front": float(args.fov_front),
             "fov_side": float(args.fov_side),
             "fov_back": float(args.fov_back),
