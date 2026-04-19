@@ -161,35 +161,55 @@ def is_image_url(u: str) -> bool:
 def choose_best_image_href_from_assets_dict(assets: Dict[str, Any]) -> Optional[str]:
     candidates: List[Tuple[int, str]] = []
 
-    def score_asset(a: Dict[str, Any]) -> int:
+    def score_asset(asset_key: str, a: Dict[str, Any]) -> int:
         score = 0
+        key = safe_str(asset_key).lower()
         roles = a.get("roles") or []
+        role_rank = 2
         if isinstance(roles, list):
-            if "visual" in roles:
-                score += 20
-            if "data" in roles:
-                score += 10
+            roles = [safe_str(r).lower() for r in roles]
             if "thumbnail" in roles:
-                score += 1
+                role_rank = 0
+            elif "data" in roles:
+                role_rank = 4
+            elif "visual" in roles:
+                role_rank = 3
+        score += role_rank * 100
+
+        if key == "hd":
+            score += 80
+        elif key == "sd":
+            score += 20
+        elif key in {"thumb", "thumbnail"}:
+            score -= 200
+
         typ = safe_str(a.get("type")).lower()
         if "image/jpeg" in typ:
             score += 5
         if "image/webp" in typ:
             score += 4
+
         href = safe_str(a.get("href"))
+        low_href = href.lower()
         if "{z}" in href or "{x}" in href or "{y}" in href:
             score -= 100
+        if "images/" in low_href:
+            score += 40
+        if "/sd." in low_href or low_href.endswith("/sd.jpg") or low_href.endswith("/sd.jpeg"):
+            score -= 40
+        if "/thumb" in low_href or low_href.endswith("/thumb.jpg") or low_href.endswith("/thumb.jpeg"):
+            score -= 200
         if is_image_url(href):
             score += 3
         return score
 
-    for _, a in assets.items():
+    for asset_key, a in assets.items():
         if not isinstance(a, dict):
             continue
         href = a.get("href")
         if not isinstance(href, str) or not href:
             continue
-        candidates.append((score_asset(a), href))
+        candidates.append((score_asset(asset_key, a), href))
 
     if not candidates:
         return None
@@ -233,6 +253,31 @@ def choose_best_asset_href(item: Dict[str, Any]) -> Optional[str]:
     if not isinstance(assets, dict):
         return None
     return choose_best_image_href_from_assets_dict(assets)
+
+def asset_info_from_assets_dict(assets: Any, img_url: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(assets, dict):
+        return None
+    target = normalize_url(img_url)
+    for key, a in assets.items():
+        if not isinstance(a, dict):
+            continue
+        href = normalize_url(safe_str(a.get("href")))
+        if href and href == target:
+            return {
+                "asset_key": safe_str(key),
+                "roles": a.get("roles") or [],
+                "type": safe_str(a.get("type")),
+                "title": safe_str(a.get("title")),
+            }
+    return None
+
+def decode_image_size(img_bytes: bytes) -> Tuple[Optional[int], Optional[int]]:
+    arr = np.frombuffer(img_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return None, None
+    h, w = img.shape[:2]
+    return int(w), int(h)
 
 def request_get_with_retry(session: requests.Session, url: str, timeout: int, max_tries: int = 4) -> requests.Response:
     last_err: Optional[Exception] = None
@@ -784,6 +829,96 @@ def estimate_yaw_center_auto(
     return 0.0, "fallback_zero", {"n_lines": int(n_lines)}
 
 
+def estimate_roll_deg_from_crop(
+    crop_bgr: np.ndarray,
+    max_abs_roll_deg: float = 8.0,
+    apply_min_abs_roll_deg: float = 1.5,
+    apply_max_abs_roll_deg: float = 5.0,
+    min_horizontal_lines: int = 5,
+) -> Tuple[float, str, dict]:
+    h, w = crop_bgr.shape[:2]
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, 60, 160)
+
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=60,
+        minLineLength=max(80, int(w * 0.10)),
+        maxLineGap=12,
+    )
+    if lines is None:
+        return 0.0, "fallback_no_lines", {"n_lines": 0, "n_horizontal": 0, "n_vertical": 0}
+
+    horiz: List[Tuple[float, float]] = []
+    n_vertical = 0
+    n_lines = 0
+    for (x1, y1, x2, y2) in lines[:, 0]:
+        dx = x2 - x1
+        dy = y2 - y1
+        length = math.hypot(dx, dy)
+        if length < max(80, w * 0.10):
+            continue
+        n_lines += 1
+        ang = math.degrees(math.atan2(dy, dx))
+        ang_abs = abs(ang)
+        if 70 <= ang_abs <= 110:
+            n_vertical += 1
+            continue
+        if ang_abs <= max_abs_roll_deg:
+            horiz.append((float(ang), float(length)))
+
+    meta = {
+        "n_lines": int(n_lines),
+        "n_horizontal": int(len(horiz)),
+        "n_vertical": int(n_vertical),
+        "angle_deg": 0.0,
+    }
+
+    if len(horiz) < min_horizontal_lines:
+        return 0.0, "fallback_few_horizontal", meta
+
+    if len(horiz) <= n_vertical:
+        return 0.0, "fallback_not_horizontal_dominant", meta
+
+    total_h = sum(wt for _, wt in horiz)
+    horiz.sort(key=lambda t: t[0])
+    acc = 0.0
+    med = 0.0
+    for ang, wt in horiz:
+        acc += wt
+        if acc >= total_h * 0.5:
+            med = ang
+            break
+    meta["angle_deg"] = float(med)
+
+    if abs(med) < apply_min_abs_roll_deg:
+        return 0.0, "fallback_small_angle", meta
+
+    if abs(med) > apply_max_abs_roll_deg:
+        return 0.0, "fallback_large_angle", meta
+
+    return float(med), "applied", meta
+
+
+def rotate_crop_level(crop_bgr: np.ndarray, roll_deg: float) -> np.ndarray:
+    if abs(float(roll_deg)) < 1e-6:
+        return crop_bgr
+    h, w = crop_bgr.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    # positive OpenCV rotation counteracts the detected screen-space tilt here
+    M = cv2.getRotationMatrix2D(center, float(roll_deg), 1.0)
+    return cv2.warpAffine(
+        crop_bgr,
+        M,
+        (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+
 # ----------------------------
 # main
 # ----------------------------
@@ -815,6 +950,9 @@ def main():
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--crop_format", choices=["jpg", "png"], default="jpg")
     ap.add_argument("--crop_jpeg_quality", type=int, default=95)
+    ap.add_argument("--log_selected_asset", action="store_true")
+    ap.add_argument("--level_roll", action="store_true")
+    ap.add_argument("--save_pre_roll_crop", action="store_true")
 
     args = ap.parse_args()
 
@@ -882,8 +1020,12 @@ def main():
         item_url = normalize_url(item_url) if item_url else ""
 
         try:
+            selected_asset = None
+            selected_source = ""
             if direct_img_url:
                 img_url = direct_img_url
+                selected_source = "feature_direct"
+                selected_asset = asset_info_from_assets_dict(f.get("assets"), img_url)
             else:
                 if not item_url:
                     raise RuntimeError("no direct image url and no item url")
@@ -891,14 +1033,31 @@ def main():
                 if not resolved:
                     raise RuntimeError("cannot resolve image url via item")
                 img_url = normalize_url(resolved)
+                selected_source = "item_resolved"
+                try:
+                    item = request_get_with_retry(session, item_url, timeout=min(args.timeout, 40), max_tries=4).json()
+                    if isinstance(item, dict):
+                        selected_asset = asset_info_from_assets_dict(item.get("assets"), img_url)
+                except Exception:
+                    selected_asset = None
 
             img_bytes, pano_ext = download_image_bytes(session, img_url, timeout=args.timeout)
+            dl_w, dl_h = decode_image_size(img_bytes)
             pano_path = panos_dir / f"{fid}{pano_ext}"
             for old_path in find_all_pano_paths(panos_dir, fid):
                 if old_path != pano_path:
                     old_path.unlink()
             pano_path.write_bytes(img_bytes)
             ok_dl += 1
+
+            if args.log_selected_asset:
+                asset_key = safe_str((selected_asset or {}).get("asset_key")) or "unknown"
+                roles = (selected_asset or {}).get("roles") or []
+                print(
+                    "[selected asset] "
+                    f"fid={fid} source={selected_source} asset_key={asset_key} "
+                    f"roles={roles} url={img_url} downloaded_size={dl_w}x{dl_h}"
+                )
 
             if args.sleep > 0:
                 time.sleep(args.sleep)
@@ -993,6 +1152,34 @@ def main():
                 out_h=args.det_h,
             )
 
+            roll_deg = 0.0
+            roll_reason = "disabled"
+            roll_meta = {"n_lines": 0, "n_horizontal": 0, "n_vertical": 0}
+            raw_crop_path = ""
+            if args.level_roll:
+                roll_deg, roll_reason, roll_meta = estimate_roll_deg_from_crop(crop)
+                if args.save_pre_roll_crop:
+                    raw_name = crop_name = build_crop_name(
+                        idx=i,
+                        fid=fid,
+                        view=view_name,
+                        yaw=yaw,
+                        fov=fov,
+                        ext=args.crop_format,
+                    )
+                    raw_crop_path = str(unique_path(crops_dir / raw_name.replace(f'.{args.crop_format}', f'__raw.{args.crop_format}'), overwrite=args.overwrite))
+                    if args.crop_format == "png":
+                        cv2.imwrite(raw_crop_path, crop)
+                    else:
+                        cv2.imwrite(raw_crop_path, crop, [int(cv2.IMWRITE_JPEG_QUALITY), int(args.crop_jpeg_quality)])
+                crop = rotate_crop_level(crop, roll_deg)
+                print(
+                    "[roll correction] "
+                    f"fid={fid} view={view_name} roll_deg={roll_deg:.3f} reason={roll_reason} "
+                    f"n_lines={roll_meta.get('n_lines', 0)} n_horizontal={roll_meta.get('n_horizontal', 0)} "
+                    f"n_vertical={roll_meta.get('n_vertical', 0)} angle_deg={roll_meta.get('angle_deg', 0.0):.3f}"
+                )
+
             crop_name = build_crop_name(
                 idx=i,
                 fid=fid,
@@ -1022,6 +1209,10 @@ def main():
                 "pitch_cli": float(args.pitch_cli),
                 "pitch_deg": float(pitch_deg),
                 "fov": float(fov),
+                "roll_deg": float(roll_deg),
+                "roll_reason": roll_reason,
+                "roll_meta": roll_meta,
+                "raw_crop_path": raw_crop_path,
                 "crop_path": str(crop_path),
                 "status": "ok" if ok else "fail",
                 "sequence_id": r.get("sequence_id", ""),
