@@ -706,6 +706,295 @@ def equirectangular_to_perspective(
     )
 
 
+def _rotation_matrix_x(deg: float) -> np.ndarray:
+    rad = math.radians(float(deg))
+    c = math.cos(rad)
+    s = math.sin(rad)
+    return np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, c, -s],
+        [0.0, s, c],
+    ], dtype=np.float64)
+
+
+def _rotation_matrix_z(deg: float) -> np.ndarray:
+    rad = math.radians(float(deg))
+    c = math.cos(rad)
+    s = math.sin(rad)
+    return np.array([
+        [c, -s, 0.0],
+        [s, c, 0.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+
+
+def _rotation_matrix_roll_pitch(roll_deg: float, pitch_deg: float) -> np.ndarray:
+    return _rotation_matrix_x(pitch_deg) @ _rotation_matrix_z(roll_deg)
+
+
+def extract_line_segments(
+    view_bgr: np.ndarray,
+    min_length_ratio: float = 0.10,
+    canny_low: int = 60,
+    canny_high: int = 160,
+) -> List[dict]:
+    h, w = view_bgr.shape[:2]
+    gray = cv2.cvtColor(view_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(gray, canny_low, canny_high)
+
+    min_len = max(40, int(min(h, w) * min_length_ratio))
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=50,
+        minLineLength=min_len,
+        maxLineGap=12,
+    )
+    if lines is None:
+        return []
+
+    segs: List[dict] = []
+    cx = w / 2.0
+    cy = h / 2.0
+    for (x1, y1, x2, y2) in lines[:, 0]:
+        dx = float(x2 - x1)
+        dy = float(y2 - y1)
+        length = float(math.hypot(dx, dy))
+        if length < min_len:
+            continue
+        angle_deg = math.degrees(math.atan2(dy, dx))
+        angle_mod = abs(angle_deg) % 180.0
+        if angle_mod > 90.0:
+            angle_mod = 180.0 - angle_mod
+        mx = (x1 + x2) / 2.0
+        my = (y1 + y2) / 2.0
+        center_dist = math.hypot(mx - cx, my - cy)
+        center_weight = max(0.25, 1.0 - center_dist / max(1.0, math.hypot(cx, cy)))
+        segs.append({
+            'x1': int(x1),
+            'y1': int(y1),
+            'x2': int(x2),
+            'y2': int(y2),
+            'length': length,
+            'angle_deg': float(angle_deg),
+            'angle_mod_deg': float(angle_mod),
+            'center_weight': float(center_weight),
+        })
+    return segs
+
+
+def apply_global_upright_to_equirectangular(
+    pano_bgr: np.ndarray,
+    roll_deg: float,
+    pitch_deg: float,
+) -> np.ndarray:
+    if abs(float(roll_deg)) < 1e-6 and abs(float(pitch_deg)) < 1e-6:
+        return pano_bgr
+
+    h, w = pano_bgr.shape[:2]
+    xs = np.arange(w, dtype=np.float64)
+    ys = np.arange(h, dtype=np.float64)
+    xv, yv = np.meshgrid(xs, ys)
+
+    lon = (xv / w - 0.5) * (2.0 * math.pi)
+    lat = (0.5 - yv / h) * math.pi
+
+    cos_lat = np.cos(lat)
+    x = np.sin(lon) * cos_lat
+    y = np.sin(lat)
+    z = np.cos(lon) * cos_lat
+    dirs = np.stack([x, y, z], axis=-1)
+
+    rot = _rotation_matrix_roll_pitch(roll_deg=roll_deg, pitch_deg=pitch_deg).T
+    dirs_src = dirs @ rot
+
+    src_lon = np.arctan2(dirs_src[..., 0], dirs_src[..., 2])
+    src_lat = np.arcsin(np.clip(dirs_src[..., 1], -1.0, 1.0))
+    u = (src_lon / (2.0 * math.pi) + 0.5) * w
+    v = (0.5 - src_lat / math.pi) * h
+
+    return cv2.remap(
+        pano_bgr,
+        u.astype(np.float32),
+        v.astype(np.float32),
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_WRAP,
+    )
+
+
+def score_upright_candidate(
+    pano_bgr: np.ndarray,
+    yaw_center_deg: float,
+    cand_roll_deg: float,
+    cand_pitch_deg: float,
+    sample_yaw_offsets_deg: Optional[List[float]] = None,
+    sample_fov_deg: float = 95.0,
+    sample_out_w: int = 640,
+    sample_out_h: int = 384,
+    sigma_deg: float = 6.0,
+) -> dict:
+    if sample_yaw_offsets_deg is None:
+        sample_yaw_offsets_deg = [0.0, 45.0, -45.0, 90.0, -90.0, 135.0, -135.0, 180.0]
+
+    upright_pano = apply_global_upright_to_equirectangular(
+        pano_bgr,
+        roll_deg=cand_roll_deg,
+        pitch_deg=cand_pitch_deg,
+    )
+
+    total_score = 0.0
+    total_horizontal = 0.0
+    total_vertical = 0.0
+    total_lines = 0
+    n_valid_views = 0
+    per_view: List[dict] = []
+
+    for yaw_off in sample_yaw_offsets_deg:
+        yaw_deg = wrap_yaw_deg(yaw_center_deg + yaw_off)
+        view = equirectangular_to_perspective(
+            upright_pano,
+            yaw_deg=yaw_deg,
+            pitch_deg=0.0,
+            fov_deg=sample_fov_deg,
+            out_w=sample_out_w,
+            out_h=sample_out_h,
+        )
+        segs = extract_line_segments(view)
+        if not segs:
+            per_view.append({
+                'yaw_deg': float(yaw_deg),
+                'n_lines': 0,
+                'score': 0.0,
+                'horizontal_score': 0.0,
+                'vertical_score': 0.0,
+            })
+            continue
+
+        view_score = 0.0
+        view_horizontal = 0.0
+        view_vertical = 0.0
+        for seg in segs:
+            angle_mod = float(seg['angle_mod_deg'])
+            horiz_resid = min(angle_mod, abs(180.0 - angle_mod))
+            vert_resid = abs(90.0 - angle_mod)
+            base_weight = float(seg['length']) * float(seg['center_weight'])
+            horiz_score = math.exp(-((horiz_resid / sigma_deg) ** 2)) * base_weight
+            vert_score = math.exp(-((vert_resid / sigma_deg) ** 2)) * base_weight
+            view_horizontal += horiz_score
+            view_vertical += vert_score
+            view_score += max(horiz_score, vert_score)
+
+        total_score += view_score
+        total_horizontal += view_horizontal
+        total_vertical += view_vertical
+        total_lines += len(segs)
+        n_valid_views += 1
+        per_view.append({
+            'yaw_deg': float(yaw_deg),
+            'n_lines': int(len(segs)),
+            'score': float(view_score),
+            'horizontal_score': float(view_horizontal),
+            'vertical_score': float(view_vertical),
+        })
+
+    balance = min(total_horizontal, total_vertical) / max(total_horizontal, total_vertical, 1e-6)
+    balanced_score = total_score * (0.7 + 0.3 * balance)
+    return {
+        'roll_deg': float(cand_roll_deg),
+        'pitch_deg': float(cand_pitch_deg),
+        'score': float(balanced_score),
+        'raw_score': float(total_score),
+        'horizontal_score': float(total_horizontal),
+        'vertical_score': float(total_vertical),
+        'balance': float(balance),
+        'n_valid_views': int(n_valid_views),
+        'n_lines': int(total_lines),
+        'views': per_view,
+    }
+
+
+def estimate_global_upright_roll_pitch(
+    pano_bgr: np.ndarray,
+    yaw_center_deg: float,
+) -> Tuple[float, float, str, dict]:
+    preview_w = min(1024, int(pano_bgr.shape[1]))
+    preview_h = max(256, int(round(preview_w / 2.0)))
+    pano_preview = cv2.resize(pano_bgr, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
+
+    coarse_rolls = np.arange(-8.0, 8.01, 2.0)
+    coarse_pitches = np.arange(-6.0, 6.01, 2.0)
+    best = None
+    for roll_deg in coarse_rolls:
+        for pitch_deg in coarse_pitches:
+            cand = score_upright_candidate(
+                pano_preview,
+                yaw_center_deg=yaw_center_deg,
+                cand_roll_deg=float(roll_deg),
+                cand_pitch_deg=float(pitch_deg),
+            )
+            if best is None or cand['score'] > best['score']:
+                best = cand
+
+    assert best is not None
+    refine_rolls = np.arange(best['roll_deg'] - 1.0, best['roll_deg'] + 1.01, 0.5)
+    refine_pitches = np.arange(best['pitch_deg'] - 1.0, best['pitch_deg'] + 1.01, 0.5)
+    refined_best = best
+    for roll_deg in refine_rolls:
+        for pitch_deg in refine_pitches:
+            cand = score_upright_candidate(
+                pano_preview,
+                yaw_center_deg=yaw_center_deg,
+                cand_roll_deg=float(roll_deg),
+                cand_pitch_deg=float(pitch_deg),
+            )
+            if cand['score'] > refined_best['score']:
+                refined_best = cand
+
+    baseline = score_upright_candidate(
+        pano_preview,
+        yaw_center_deg=yaw_center_deg,
+        cand_roll_deg=0.0,
+        cand_pitch_deg=0.0,
+    )
+
+    reason = 'applied'
+    if refined_best['n_valid_views'] < 2 or refined_best['n_lines'] < 24:
+        refined_best = baseline
+        reason = 'fallback_insufficient_structure'
+    elif refined_best['score'] < baseline['score'] * 1.03:
+        refined_best = baseline
+        reason = 'fallback_low_gain'
+    elif abs(refined_best['roll_deg']) < 0.5 and abs(refined_best['pitch_deg']) < 0.5:
+        refined_best = baseline
+        reason = 'fallback_small_adjustment'
+
+    meta = {
+        'score': float(refined_best['score']),
+        'raw_score': float(refined_best['raw_score']),
+        'horizontal_score': float(refined_best['horizontal_score']),
+        'vertical_score': float(refined_best['vertical_score']),
+        'balance': float(refined_best['balance']),
+        'n_valid_views': int(refined_best['n_valid_views']),
+        'n_lines': int(refined_best['n_lines']),
+        'coarse_best': {
+            'roll_deg': float(best['roll_deg']),
+            'pitch_deg': float(best['pitch_deg']),
+            'score': float(best['score']),
+        },
+        'baseline': {
+            'score': float(baseline['score']),
+            'raw_score': float(baseline['raw_score']),
+            'n_valid_views': int(baseline['n_valid_views']),
+            'n_lines': int(baseline['n_lines']),
+        },
+        'views': refined_best['views'],
+        'preview_size': [int(preview_w), int(preview_h)],
+    }
+    return float(refined_best['roll_deg']), float(refined_best['pitch_deg']), reason, meta
+
+
 # ----------------------------
 # yaw推定
 # ----------------------------
@@ -850,11 +1139,19 @@ def estimate_roll_deg_from_crop(
         maxLineGap=12,
     )
     if lines is None:
-        return 0.0, "fallback_no_lines", {"n_lines": 0, "n_horizontal": 0, "n_vertical": 0}
+        return 0.0, "fallback_no_lines", {
+            "n_lines": 0,
+            "n_horizontal": 0,
+            "n_vertical": 0,
+            "angle_deg": 0.0,
+            "horizontal_weight": 0.0,
+            "vertical_weight": 0.0,
+        }
 
     horiz: List[Tuple[float, float]] = []
     n_vertical = 0
     n_lines = 0
+    vertical_weight = 0.0
     for (x1, y1, x2, y2) in lines[:, 0]:
         dx = x2 - x1
         dy = y2 - y1
@@ -866,21 +1163,26 @@ def estimate_roll_deg_from_crop(
         ang_abs = abs(ang)
         if 70 <= ang_abs <= 110:
             n_vertical += 1
+            vertical_weight += float(length)
             continue
         if ang_abs <= max_abs_roll_deg:
             horiz.append((float(ang), float(length)))
 
+    horizontal_weight = float(sum(wt for _, wt in horiz))
     meta = {
         "n_lines": int(n_lines),
         "n_horizontal": int(len(horiz)),
         "n_vertical": int(n_vertical),
         "angle_deg": 0.0,
+        "horizontal_weight": horizontal_weight,
+        "vertical_weight": float(vertical_weight),
     }
 
-    if len(horiz) < min_horizontal_lines:
+    min_horizontal_weight = float(max(0.0, w * 0.55))
+    if len(horiz) < min_horizontal_lines and horizontal_weight < min_horizontal_weight:
         return 0.0, "fallback_few_horizontal", meta
 
-    if len(horiz) <= n_vertical:
+    if len(horiz) <= n_vertical and horizontal_weight <= vertical_weight * 1.15:
         return 0.0, "fallback_not_horizontal_dominant", meta
 
     total_h = sum(wt for _, wt in horiz)
@@ -901,6 +1203,226 @@ def estimate_roll_deg_from_crop(
         return 0.0, "fallback_large_angle", meta
 
     return float(med), "applied", meta
+
+
+def is_applied_roll_reason(reason: str) -> bool:
+    return safe_str(reason).startswith("applied")
+
+
+def _weighted_median_angle(records: List[dict]) -> float:
+    ordered = sorted(records, key=lambda c: c["roll_deg"])
+    total = sum(c["effective_weight"] for c in ordered)
+    if total <= 0.0:
+        return 0.0
+    acc = 0.0
+    for rec in ordered:
+        acc += rec["effective_weight"]
+        if acc >= total * 0.5:
+            return float(rec["roll_deg"])
+    return float(ordered[-1]["roll_deg"])
+
+
+def _weighted_quantile_abs_dev(records: List[dict], center_deg: float, q: float = 0.7) -> float:
+    ordered = sorted(
+        (abs(rec["roll_deg"] - center_deg), rec["effective_weight"])
+        for rec in records
+    )
+    total = sum(wt for _, wt in ordered)
+    if total <= 0.0:
+        return 0.0
+    acc = 0.0
+    for dev, wt in ordered:
+        acc += wt
+        if acc >= total * q:
+            return float(dev)
+    return float(ordered[-1][0])
+
+
+def _build_pano_roll_candidates(view_rolls: List[dict]) -> List[dict]:
+    candidates: List[dict] = []
+    for rec in view_rolls:
+        reason = rec["reason"]
+        angle_deg = float(rec["angle_deg"])
+        weight = float(rec["horizontal_weight"])
+        n_horizontal = int(rec["n_horizontal"])
+        if weight <= 0.0 or n_horizontal <= 0:
+            continue
+        if reason == "applied":
+            confidence = "strong"
+            effective_weight = weight
+        elif reason == "fallback_small_angle" and abs(angle_deg) >= 0.75:
+            confidence = "weak_small"
+            effective_weight = weight * 0.45
+        elif reason == "fallback_large_angle" and abs(angle_deg) <= 6.5 and n_horizontal >= 6:
+            confidence = "weak_large"
+            effective_weight = weight * 0.35
+        else:
+            continue
+        candidates.append({
+            **rec,
+            "effective_weight": float(effective_weight),
+            "confidence": confidence,
+        })
+    return candidates
+
+
+def estimate_pano_roll_deg(
+    pano_bgr: np.ndarray,
+    yaw_center_deg: float,
+    pitch_deg: float,
+    out_w: int,
+    out_h: int,
+    fov_front: float,
+    fov_side: float,
+    fov_back: float,
+) -> Tuple[float, str, dict]:
+    view_specs = [
+        ("front", 0.0, fov_front),
+        ("left", -90.0, fov_side),
+        ("right", 90.0, fov_side),
+        ("back", 180.0, fov_back),
+    ]
+    view_rolls: List[dict] = []
+
+    for view_name, yaw_off, fov in view_specs:
+        yaw = wrap_yaw_deg(yaw_center_deg + yaw_off)
+        crop = equirectangular_to_perspective(
+            pano_bgr,
+            yaw_deg=yaw,
+            pitch_deg=pitch_deg,
+            fov_deg=fov,
+            out_w=out_w,
+            out_h=out_h,
+        )
+        roll_deg, reason, meta = estimate_roll_deg_from_crop(
+            crop,
+            max_abs_roll_deg=8.0,
+            apply_min_abs_roll_deg=1.0,
+            apply_max_abs_roll_deg=8.0,
+            min_horizontal_lines=4,
+        )
+        angle_deg = float(meta.get("angle_deg", 0.0))
+        weight = float(meta.get("horizontal_weight", 0.0))
+        rec = {
+            "view": view_name,
+            "yaw": float(yaw),
+            "fov": float(fov),
+            "roll_deg": float(roll_deg),
+            "reason": reason,
+            "angle_deg": angle_deg,
+            "n_horizontal": int(meta.get("n_horizontal", 0)),
+            "n_vertical": int(meta.get("n_vertical", 0)),
+            "horizontal_weight": weight,
+            "vertical_weight": float(meta.get("vertical_weight", 0.0)),
+        }
+        view_rolls.append(rec)
+
+    candidates = _build_pano_roll_candidates(view_rolls)
+    meta = {
+        "n_candidates": int(len(candidates)),
+        "n_strong_candidates": int(sum(c["confidence"] == "strong" for c in candidates)),
+        "angle_deg": 0.0,
+        "consensus_abs_dev_deg": 0.0,
+        "consensus_weight": 0.0,
+        "views": view_rolls,
+    }
+
+    if not candidates:
+        return 0.0, "fallback_insufficient_candidates", meta
+
+    pos = [c for c in candidates if c["roll_deg"] > 0]
+    neg = [c for c in candidates if c["roll_deg"] < 0]
+    pos_weight = sum(c["effective_weight"] for c in pos)
+    neg_weight = sum(c["effective_weight"] for c in neg)
+    pos_count = len(pos)
+    neg_count = len(neg)
+    total_weight = pos_weight + neg_weight
+
+    if pos_count == 0 and neg_count == 0:
+        return 0.0, "fallback_insufficient_candidates", meta
+
+    if pos_count == neg_count:
+        if pos_weight == neg_weight:
+            return 0.0, "fallback_no_sign_consensus", meta
+        dominant = pos if pos_weight > neg_weight else neg
+        dominant_weight = max(pos_weight, neg_weight)
+        dominant_count = len(dominant)
+    else:
+        dominant = pos if pos_count > neg_count else neg
+        dominant_weight = pos_weight if pos_count > neg_count else neg_weight
+        dominant_count = len(dominant)
+
+    meta["consensus_weight"] = float(dominant_weight)
+    dominant_share = (dominant_weight / total_weight) if total_weight > 0.0 else 0.0
+    strong_dominant = [c for c in dominant if c["confidence"] == "strong"]
+
+    if dominant_count >= 3:
+        provisional = _weighted_median_angle(dominant)
+        trimmed = list(dominant)
+        while len(trimmed) > 2:
+            devs = [(abs(rec["roll_deg"] - provisional), idx) for idx, rec in enumerate(trimmed)]
+            worst_dev, worst_idx = max(devs)
+            if worst_dev <= 2.25:
+                break
+            trimmed.pop(worst_idx)
+            provisional = _weighted_median_angle(trimmed)
+        dominant = trimmed
+        dominant_weight = sum(c["effective_weight"] for c in dominant)
+        dominant_share = (dominant_weight / total_weight) if total_weight > 0.0 else 0.0
+        strong_dominant = [c for c in dominant if c["confidence"] == "strong"]
+        meta["consensus_weight"] = float(dominant_weight)
+
+    if dominant_count < 2 and not (len(strong_dominant) >= 1 and total_weight >= 1200.0):
+        return 0.0, "fallback_insufficient_candidates", meta
+
+    if dominant_count < 2:
+        consensus_roll = float(strong_dominant[0]["roll_deg"])
+        weak_roll = max(-2.5, min(2.5, consensus_roll * 0.6))
+        if abs(weak_roll) < 0.9:
+            return 0.0, "fallback_small_angle", meta
+        meta["angle_deg"] = float(weak_roll)
+        meta["consensus_abs_dev_deg"] = 0.0
+        return float(weak_roll), "applied_weak_single_view", meta
+
+    if dominant_share < 0.45 and len(strong_dominant) < 2:
+        return 0.0, "fallback_no_sign_consensus", meta
+
+    consensus_roll = _weighted_median_angle(dominant)
+    consensus_abs_dev = _weighted_quantile_abs_dev(dominant, consensus_roll, q=0.7)
+    meta["angle_deg"] = float(consensus_roll)
+    meta["consensus_abs_dev_deg"] = float(consensus_abs_dev)
+
+    if consensus_abs_dev > 2.4:
+        return 0.0, "fallback_inconsistent_angles", meta
+
+    if abs(consensus_roll) < 1.2:
+        weak_roll = max(-1.25, min(1.25, consensus_roll))
+        if abs(weak_roll) < 0.9:
+            return 0.0, "fallback_small_angle", meta
+        meta["angle_deg"] = float(weak_roll)
+        return float(weak_roll), "applied_weak_consensus", meta
+
+    if abs(consensus_roll) > 7.5:
+        return 0.0, "fallback_large_angle", meta
+
+    if dominant_share < 0.52 and len(strong_dominant) < 2:
+        weak_roll = max(-2.5, min(2.5, consensus_roll * 0.65))
+        if abs(weak_roll) < 0.9:
+            return 0.0, "fallback_no_sign_consensus", meta
+        meta["angle_deg"] = float(weak_roll)
+        return float(weak_roll), "applied_weak_consensus", meta
+
+    return float(consensus_roll), "applied", meta
+
+
+def apply_roll_sequence(
+    crop_bgr: np.ndarray,
+    pano_roll_deg: float,
+    local_roll_deg: float,
+) -> np.ndarray:
+    crop = rotate_crop_level(crop_bgr, pano_roll_deg)
+    crop = rotate_crop_level(crop, local_roll_deg)
+    return crop
 
 
 def rotate_crop_level(crop_bgr: np.ndarray, roll_deg: float) -> np.ndarray:
@@ -964,6 +1486,7 @@ def main():
     crops_dir = run_dir / "crops"
     aoi_index_path = run_dir / "aoi_index.jsonl"
     yaw_map_path = run_dir / "yaw_map.jsonl"
+    roll_map_path = run_dir / "roll_map.jsonl"
     crop_log_path = run_dir / "crop_log.jsonl"
     summary_path = run_dir / "summary.json"
 
@@ -971,7 +1494,7 @@ def main():
         ensure_dir(d)
 
     if args.overwrite:
-        for p in [aoi_index_path, yaw_map_path, crop_log_path]:
+        for p in [aoi_index_path, yaw_map_path, roll_map_path, crop_log_path]:
             if p.exists():
                 p.unlink()
 
@@ -1133,6 +1656,41 @@ def main():
         total_panos += 1
         yaw_center = float(yaw_map.get(fid, 0.0))
 
+        upright_roll_deg = 0.0
+        upright_pitch_deg = 0.0
+        upright_reason = "disabled"
+        upright_meta = {
+            "score": 0.0,
+            "raw_score": 0.0,
+            "horizontal_score": 0.0,
+            "vertical_score": 0.0,
+            "balance": 0.0,
+            "n_valid_views": 0,
+            "n_lines": 0,
+            "views": [],
+        }
+        upright_pano = pano
+        if args.level_roll:
+            upright_roll_deg, upright_pitch_deg, upright_reason, upright_meta = estimate_global_upright_roll_pitch(
+                pano,
+                yaw_center_deg=yaw_center,
+            )
+            upright_pano = apply_global_upright_to_equirectangular(
+                pano,
+                roll_deg=upright_roll_deg,
+                pitch_deg=upright_pitch_deg,
+            )
+        append_jsonl(roll_map_path, {
+            "step": "global_upright",
+            "i": i,
+            "fid": fid,
+            "yaw_center": yaw_center,
+            "roll_deg": float(upright_roll_deg),
+            "pitch_deg": float(upright_pitch_deg),
+            "roll_reason": upright_reason,
+            "roll_meta": upright_meta,
+        })
+
         views = [
             ("front", 0.0, args.fov_front),
             ("left", -90.0, args.fov_side),
@@ -1142,42 +1700,52 @@ def main():
 
         for view_name, yaw_off, fov in views:
             yaw = wrap_yaw_deg(yaw_center + yaw_off)
+            raw_crop_path = ""
+            if args.level_roll and args.save_pre_roll_crop:
+                raw_crop = equirectangular_to_perspective(
+                    pano,
+                    yaw_deg=yaw,
+                    pitch_deg=pitch_deg,
+                    fov_deg=fov,
+                    out_w=args.det_w,
+                    out_h=args.det_h,
+                )
+                raw_name = build_crop_name(
+                    idx=i,
+                    fid=fid,
+                    view=view_name,
+                    yaw=yaw,
+                    fov=fov,
+                    ext=args.crop_format,
+                )
+                raw_crop_path = str(unique_path(crops_dir / raw_name.replace(f'.{args.crop_format}', f'__raw.{args.crop_format}'), overwrite=args.overwrite))
+                if args.crop_format == "png":
+                    cv2.imwrite(raw_crop_path, raw_crop)
+                else:
+                    cv2.imwrite(raw_crop_path, raw_crop, [int(cv2.IMWRITE_JPEG_QUALITY), int(args.crop_jpeg_quality)])
 
             crop = equirectangular_to_perspective(
-                pano,
+                upright_pano,
                 yaw_deg=yaw,
                 pitch_deg=pitch_deg,
                 fov_deg=fov,
                 out_w=args.det_w,
                 out_h=args.det_h,
             )
-
-            roll_deg = 0.0
-            roll_reason = "disabled"
-            roll_meta = {"n_lines": 0, "n_horizontal": 0, "n_vertical": 0}
-            raw_crop_path = ""
+            roll_meta = {
+                "source": "upright_pano_before_crop",
+                "upright_roll_deg": float(upright_roll_deg),
+                "upright_pitch_deg": float(upright_pitch_deg),
+                "upright_score": float(upright_meta.get("score", 0.0)),
+                "upright_n_valid_views": int(upright_meta.get("n_valid_views", 0)),
+                "upright_n_lines": int(upright_meta.get("n_lines", 0)),
+            }
             if args.level_roll:
-                roll_deg, roll_reason, roll_meta = estimate_roll_deg_from_crop(crop)
-                if args.save_pre_roll_crop:
-                    raw_name = crop_name = build_crop_name(
-                        idx=i,
-                        fid=fid,
-                        view=view_name,
-                        yaw=yaw,
-                        fov=fov,
-                        ext=args.crop_format,
-                    )
-                    raw_crop_path = str(unique_path(crops_dir / raw_name.replace(f'.{args.crop_format}', f'__raw.{args.crop_format}'), overwrite=args.overwrite))
-                    if args.crop_format == "png":
-                        cv2.imwrite(raw_crop_path, crop)
-                    else:
-                        cv2.imwrite(raw_crop_path, crop, [int(cv2.IMWRITE_JPEG_QUALITY), int(args.crop_jpeg_quality)])
-                crop = rotate_crop_level(crop, roll_deg)
                 print(
-                    "[roll correction] "
-                    f"fid={fid} view={view_name} roll_deg={roll_deg:.3f} reason={roll_reason} "
-                    f"n_lines={roll_meta.get('n_lines', 0)} n_horizontal={roll_meta.get('n_horizontal', 0)} "
-                    f"n_vertical={roll_meta.get('n_vertical', 0)} angle_deg={roll_meta.get('angle_deg', 0.0):.3f}"
+                    "[global upright crop] "
+                    f"fid={fid} view={view_name} yaw={yaw:.3f} "
+                    f"upright_roll_deg={upright_roll_deg:.3f} upright_pitch_deg={upright_pitch_deg:.3f} "
+                    f"upright_reason={upright_reason}"
                 )
 
             crop_name = build_crop_name(
@@ -1209,9 +1777,16 @@ def main():
                 "pitch_cli": float(args.pitch_cli),
                 "pitch_deg": float(pitch_deg),
                 "fov": float(fov),
-                "roll_deg": float(roll_deg),
-                "roll_reason": roll_reason,
+                "roll_deg": float(upright_roll_deg),
+                "roll_reason": upright_reason,
                 "roll_meta": roll_meta,
+                "pano_roll_deg": float(upright_roll_deg),
+                "pano_roll_reason": upright_reason,
+                "pano_roll_meta": upright_meta,
+                "global_pitch_deg": float(upright_pitch_deg),
+                "local_roll_deg": 0.0,
+                "local_roll_reason": "disabled_global_upright_pipeline",
+                "local_roll_meta": {},
                 "raw_crop_path": raw_crop_path,
                 "crop_path": str(crop_path),
                 "status": "ok" if ok else "fail",
@@ -1248,6 +1823,7 @@ def main():
             "yaw_preview_w": int(args.yaw_preview_w),
             "yaw_preview_h": int(args.yaw_preview_h),
             "api_base": args.api_base,
+            "roll_application_mode": "raw_pano_to_upright_pano_to_crop",
         },
         "paths": {
             "run_dir": str(run_dir),
