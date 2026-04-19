@@ -834,6 +834,8 @@ def score_upright_candidate(
     sample_out_w: int = 640,
     sample_out_h: int = 384,
     sigma_deg: float = 6.0,
+    target_pitch_deg: Optional[float] = None,
+    target_view_specs: Optional[List[Tuple[str, float, float]]] = None,
 ) -> dict:
     if sample_yaw_offsets_deg is None:
         sample_yaw_offsets_deg = [0.0, 45.0, -45.0, 90.0, -90.0, 135.0, -135.0, 180.0]
@@ -917,6 +919,54 @@ def score_upright_candidate(
     view_coverage = effective_views / max(1, len(sample_yaw_offsets_deg))
     dominant_view_share = max_view_score / max(total_score, 1e-6)
     magnitude_penalty = max(0.0, 1.0 - abs(float(cand_roll_deg)) / 6.0) * max(0.0, 1.0 - abs(float(cand_pitch_deg)) / 4.0)
+
+    target_mean_abs_angle = 0.0
+    target_max_abs_angle = 0.0
+    target_valid_views = 0
+    target_views: List[dict] = []
+    if target_pitch_deg is not None:
+        if target_view_specs is None:
+            target_view_specs = [
+                ('front', 0.0, 105.0),
+                ('left', -90.0, 90.0),
+                ('right', 90.0, 90.0),
+                ('back', 180.0, 105.0),
+            ]
+        target_abs_angles: List[float] = []
+        for view_name, yaw_off, fov_deg in target_view_specs:
+            yaw_deg = wrap_yaw_deg(yaw_center_deg + yaw_off)
+            crop = equirectangular_to_perspective(
+                upright_pano,
+                yaw_deg=yaw_deg,
+                pitch_deg=float(target_pitch_deg),
+                fov_deg=float(fov_deg),
+                out_w=sample_out_w,
+                out_h=sample_out_w,
+            )
+            _, reason, meta = estimate_roll_deg_from_crop(
+                crop,
+                max_abs_roll_deg=8.0,
+                apply_min_abs_roll_deg=0.0,
+                apply_max_abs_roll_deg=8.0,
+                min_horizontal_lines=0,
+            )
+            angle_abs = abs(float(meta.get('angle_deg', 0.0)))
+            target_abs_angles.append(angle_abs)
+            if int(meta.get('n_horizontal', 0)) > 0:
+                target_valid_views += 1
+            target_views.append({
+                'view': view_name,
+                'yaw_off_deg': float(yaw_off),
+                'fov_deg': float(fov_deg),
+                'angle_abs_deg': float(angle_abs),
+                'reason': reason,
+                'n_horizontal': int(meta.get('n_horizontal', 0)),
+                'n_vertical': int(meta.get('n_vertical', 0)),
+            })
+        if target_abs_angles:
+            target_mean_abs_angle = float(sum(target_abs_angles) / len(target_abs_angles))
+            target_max_abs_angle = float(max(target_abs_angles))
+
     conservative_score = total_score
     conservative_score *= 0.55 + 0.45 * balance
     conservative_score *= 0.60 + 0.40 * side_balance
@@ -924,6 +974,13 @@ def score_upright_candidate(
     conservative_score *= 0.70 + 0.30 * magnitude_penalty
     if dominant_view_share > 0.42:
         conservative_score *= max(0.15, 1.0 - (dominant_view_share - 0.42) * 1.6)
+    if target_pitch_deg is not None:
+        target_alignment = max(0.0, 1.0 - target_mean_abs_angle / 4.5)
+        target_support = target_valid_views / max(1, len(target_view_specs or []))
+        target_max_guard = max(0.0, 1.0 - target_max_abs_angle / 6.0)
+        conservative_score *= 0.25 + 0.75 * target_alignment
+        conservative_score *= 0.55 + 0.45 * target_support
+        conservative_score *= 0.55 + 0.45 * target_max_guard
 
     return {
         'roll_deg': float(cand_roll_deg),
@@ -940,6 +997,10 @@ def score_upright_candidate(
         'view_coverage': float(view_coverage),
         'dominant_view_share': float(dominant_view_share),
         'magnitude_penalty': float(magnitude_penalty),
+        'target_mean_abs_angle_deg': float(target_mean_abs_angle),
+        'target_max_abs_angle_deg': float(target_max_abs_angle),
+        'target_valid_views': int(target_valid_views),
+        'target_views': target_views,
         'n_valid_views': int(n_valid_views),
         'n_lines': int(total_lines),
         'views': per_view,
@@ -949,21 +1010,51 @@ def score_upright_candidate(
 def estimate_global_upright_roll_pitch(
     pano_bgr: np.ndarray,
     yaw_center_deg: float,
+    target_pitch_deg: float = 0.0,
+    fov_front: float = 105.0,
+    fov_side: float = 90.0,
+    fov_back: float = 105.0,
 ) -> Tuple[float, float, str, dict]:
     preview_w = min(1024, int(pano_bgr.shape[1]))
     preview_h = max(256, int(round(preview_w / 2.0)))
     pano_preview = cv2.resize(pano_bgr, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
+
+    target_view_specs = [
+        ('front', 0.0, float(fov_front)),
+        ('left', -90.0, float(fov_side)),
+        ('right', 90.0, float(fov_side)),
+        ('back', 180.0, float(fov_back)),
+    ]
 
     baseline = score_upright_candidate(
         pano_preview,
         yaw_center_deg=yaw_center_deg,
         cand_roll_deg=0.0,
         cand_pitch_deg=0.0,
+        target_pitch_deg=target_pitch_deg,
+        target_view_specs=target_view_specs,
     )
 
     coarse_rolls = np.arange(-5.0, 5.01, 1.0)
     coarse_pitches = np.arange(-3.0, 3.01, 1.0)
     best = dict(baseline)
+    best_target_candidate = dict(baseline)
+
+    def should_prefer_target_candidate(cand: dict, incumbent: dict) -> bool:
+        cand_valid = int(cand.get('target_valid_views', 0))
+        inc_valid = int(incumbent.get('target_valid_views', 0))
+        cand_mean = float(cand.get('target_mean_abs_angle_deg', 1e9))
+        inc_mean = float(incumbent.get('target_mean_abs_angle_deg', 1e9))
+        cand_max = float(cand.get('target_max_abs_angle_deg', 1e9))
+        inc_max = float(incumbent.get('target_max_abs_angle_deg', 1e9))
+        if cand_valid != inc_valid:
+            return cand_valid > inc_valid
+        if abs(cand_mean - inc_mean) > 1e-6:
+            return cand_mean < inc_mean
+        if abs(cand_max - inc_max) > 1e-6:
+            return cand_max < inc_max
+        return float(cand.get('score', 0.0)) > float(incumbent.get('score', 0.0))
+
     for roll_deg in coarse_rolls:
         for pitch_deg in coarse_pitches:
             cand = score_upright_candidate(
@@ -971,9 +1062,19 @@ def estimate_global_upright_roll_pitch(
                 yaw_center_deg=yaw_center_deg,
                 cand_roll_deg=float(roll_deg),
                 cand_pitch_deg=float(pitch_deg),
+                target_pitch_deg=target_pitch_deg,
+                target_view_specs=target_view_specs,
             )
             if cand['score'] > best['score']:
                 best = cand
+            if (
+                0.5 <= abs(float(cand['roll_deg'])) <= 3.5
+                and abs(float(cand['pitch_deg'])) <= 2.0
+                and int(cand.get('target_valid_views', 0)) >= 3
+                and float(cand.get('score', 0.0)) >= float(baseline.get('score', 0.0)) * 0.82
+                and should_prefer_target_candidate(cand, best_target_candidate)
+            ):
+                best_target_candidate = dict(cand)
 
     refine_rolls = np.arange(best['roll_deg'] - 0.5, best['roll_deg'] + 0.501, 0.25)
     refine_pitches = np.arange(best['pitch_deg'] - 0.5, best['pitch_deg'] + 0.501, 0.25)
@@ -985,13 +1086,35 @@ def estimate_global_upright_roll_pitch(
                 yaw_center_deg=yaw_center_deg,
                 cand_roll_deg=float(roll_deg),
                 cand_pitch_deg=float(pitch_deg),
+                target_pitch_deg=target_pitch_deg,
+                target_view_specs=target_view_specs,
             )
             if cand['score'] > refined_best['score']:
                 refined_best = cand
+            if (
+                0.5 <= abs(float(cand['roll_deg'])) <= 3.5
+                and abs(float(cand['pitch_deg'])) <= 2.0
+                and int(cand.get('target_valid_views', 0)) >= 3
+                and float(cand.get('score', 0.0)) >= float(baseline.get('score', 0.0)) * 0.82
+                and should_prefer_target_candidate(cand, best_target_candidate)
+            ):
+                best_target_candidate = dict(cand)
 
     best_before_fallback = dict(refined_best)
-    best_score = float(best_before_fallback['score'])
+    selection_mode = 'score_best'
     baseline_score = float(baseline['score'])
+    baseline_target_mean = float(baseline.get('target_mean_abs_angle_deg', 0.0))
+    baseline_target_max = float(baseline.get('target_max_abs_angle_deg', 0.0))
+    target_override_gain = baseline_target_mean - float(best_target_candidate.get('target_mean_abs_angle_deg', baseline_target_mean))
+    target_override_max_gain = baseline_target_max - float(best_target_candidate.get('target_max_abs_angle_deg', baseline_target_max))
+    if (
+        target_override_gain >= 0.12
+        and target_override_max_gain >= 0.05
+        and float(best_target_candidate.get('score', 0.0)) >= baseline_score * 0.82
+    ):
+        best_before_fallback = dict(best_target_candidate)
+        selection_mode = 'target_view_override'
+    best_score = float(best_before_fallback['score'])
     score_gain = float(best_score - baseline_score)
     score_gain_ratio = (best_score / max(baseline_score, 1e-6)) if baseline_score > 0.0 else 1.0
 
@@ -999,7 +1122,7 @@ def estimate_global_upright_roll_pitch(
     if best_before_fallback['n_valid_views'] < 3 or best_before_fallback['n_lines'] < 36:
         refined_best = baseline
         reason = 'fallback_insufficient_structure'
-    elif best_before_fallback['effective_views'] < 3 or best_before_fallback['view_coverage'] < 0.38:
+    elif best_before_fallback['effective_views'] < 3 or (best_before_fallback['view_coverage'] < 0.35 and int(best_before_fallback.get('target_valid_views', 0)) < 4):
         refined_best = baseline
         reason = 'fallback_sparse_view_support'
     elif best_before_fallback['balance'] < 0.16 or best_before_fallback['side_balance'] < 0.22:
@@ -1012,11 +1135,15 @@ def estimate_global_upright_roll_pitch(
         refined_best = baseline
         reason = 'fallback_large_adjustment'
     elif score_gain < max(120.0, baseline_score * 0.08):
-        refined_best = baseline
-        reason = 'fallback_low_gain'
+        target_angle_gain = float(baseline.get('target_mean_abs_angle_deg', 0.0) - best_before_fallback.get('target_mean_abs_angle_deg', 0.0))
+        if not (target_angle_gain >= 0.12 and abs(best_before_fallback['roll_deg']) <= 3.5 and abs(best_before_fallback['pitch_deg']) <= 2.0):
+            refined_best = baseline
+            reason = 'fallback_low_gain'
     elif score_gain_ratio < 1.08:
-        refined_best = baseline
-        reason = 'fallback_low_gain_ratio'
+        target_angle_gain = float(baseline.get('target_mean_abs_angle_deg', 0.0) - best_before_fallback.get('target_mean_abs_angle_deg', 0.0))
+        if not (target_angle_gain >= 0.12 and abs(best_before_fallback['roll_deg']) <= 3.5 and abs(best_before_fallback['pitch_deg']) <= 2.0):
+            refined_best = baseline
+            reason = 'fallback_low_gain_ratio'
     elif abs(best_before_fallback['roll_deg']) < 0.5 and abs(best_before_fallback['pitch_deg']) < 0.5:
         refined_best = baseline
         reason = 'fallback_small_adjustment'
@@ -1034,12 +1161,19 @@ def estimate_global_upright_roll_pitch(
         'view_coverage': float(refined_best.get('view_coverage', 0.0)),
         'dominant_view_share': float(refined_best.get('dominant_view_share', 0.0)),
         'magnitude_penalty': float(refined_best.get('magnitude_penalty', 0.0)),
+        'target_mean_abs_angle_deg': float(refined_best.get('target_mean_abs_angle_deg', 0.0)),
+        'target_max_abs_angle_deg': float(refined_best.get('target_max_abs_angle_deg', 0.0)),
+        'target_valid_views': int(refined_best.get('target_valid_views', 0)),
+        'target_views': refined_best.get('target_views', []),
         'n_valid_views': int(refined_best['n_valid_views']),
         'n_lines': int(refined_best['n_lines']),
         'best_score': float(best_score),
         'baseline_score': float(baseline_score),
         'score_gain': float(score_gain),
         'score_gain_ratio': float(score_gain_ratio),
+        'selection_mode': selection_mode,
+        'target_override_gain': float(target_override_gain),
+        'target_override_max_gain': float(target_override_max_gain),
         'coarse_best': {
             'roll_deg': float(best['roll_deg']),
             'pitch_deg': float(best['pitch_deg']),
@@ -1054,6 +1188,10 @@ def estimate_global_upright_roll_pitch(
             'effective_views': int(best_before_fallback.get('effective_views', 0)),
             'view_coverage': float(best_before_fallback.get('view_coverage', 0.0)),
             'dominant_view_share': float(best_before_fallback.get('dominant_view_share', 0.0)),
+            'target_mean_abs_angle_deg': float(best_before_fallback.get('target_mean_abs_angle_deg', 0.0)),
+            'target_max_abs_angle_deg': float(best_before_fallback.get('target_max_abs_angle_deg', 0.0)),
+            'target_valid_views': int(best_before_fallback.get('target_valid_views', 0)),
+            'target_views': best_before_fallback.get('target_views', []),
         },
         'baseline': {
             'score': float(baseline['score']),
@@ -1066,6 +1204,10 @@ def estimate_global_upright_roll_pitch(
             'view_coverage': float(baseline.get('view_coverage', 0.0)),
             'n_valid_views': int(baseline['n_valid_views']),
             'n_lines': int(baseline['n_lines']),
+            'target_mean_abs_angle_deg': float(baseline.get('target_mean_abs_angle_deg', 0.0)),
+            'target_max_abs_angle_deg': float(baseline.get('target_max_abs_angle_deg', 0.0)),
+            'target_valid_views': int(baseline.get('target_valid_views', 0)),
+            'target_views': baseline.get('target_views', []),
         },
         'views': refined_best['views'],
         'preview_size': [int(preview_w), int(preview_h)],
@@ -1752,6 +1894,10 @@ def main():
             upright_roll_deg, upright_pitch_deg, upright_reason, upright_meta = estimate_global_upright_roll_pitch(
                 pano,
                 yaw_center_deg=yaw_center,
+                target_pitch_deg=pitch_deg,
+                fov_front=args.fov_front,
+                fov_side=args.fov_side,
+                fov_back=args.fov_back,
             )
             upright_pano = apply_global_upright_to_equirectangular(
                 pano,
