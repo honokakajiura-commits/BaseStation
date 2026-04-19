@@ -850,6 +850,9 @@ def score_upright_candidate(
     total_lines = 0
     n_valid_views = 0
     per_view: List[dict] = []
+    view_scores: List[float] = []
+    side_score = 0.0
+    front_back_score = 0.0
 
     for yaw_off in sample_yaw_offsets_deg:
         yaw_deg = wrap_yaw_deg(yaw_center_deg + yaw_off)
@@ -865,11 +868,13 @@ def score_upright_candidate(
         if not segs:
             per_view.append({
                 'yaw_deg': float(yaw_deg),
+                'yaw_off_deg': float(yaw_off),
                 'n_lines': 0,
                 'score': 0.0,
                 'horizontal_score': 0.0,
                 'vertical_score': 0.0,
             })
+            view_scores.append(0.0)
             continue
 
         view_score = 0.0
@@ -891,24 +896,50 @@ def score_upright_candidate(
         total_vertical += view_vertical
         total_lines += len(segs)
         n_valid_views += 1
+        if abs(float(yaw_off)) >= 60.0 and abs(float(yaw_off)) <= 120.0:
+            side_score += view_score
+        else:
+            front_back_score += view_score
         per_view.append({
             'yaw_deg': float(yaw_deg),
+            'yaw_off_deg': float(yaw_off),
             'n_lines': int(len(segs)),
             'score': float(view_score),
             'horizontal_score': float(view_horizontal),
             'vertical_score': float(view_vertical),
         })
+        view_scores.append(float(view_score))
 
     balance = min(total_horizontal, total_vertical) / max(total_horizontal, total_vertical, 1e-6)
-    balanced_score = total_score * (0.7 + 0.3 * balance)
+    side_balance = min(side_score, front_back_score) / max(side_score, front_back_score, 1e-6)
+    max_view_score = max(view_scores) if view_scores else 0.0
+    effective_views = sum(1 for rec in per_view if rec['n_lines'] >= 6 and rec['score'] >= max(80.0, max_view_score * 0.28))
+    view_coverage = effective_views / max(1, len(sample_yaw_offsets_deg))
+    dominant_view_share = max_view_score / max(total_score, 1e-6)
+    magnitude_penalty = max(0.0, 1.0 - abs(float(cand_roll_deg)) / 6.0) * max(0.0, 1.0 - abs(float(cand_pitch_deg)) / 4.0)
+    conservative_score = total_score
+    conservative_score *= 0.55 + 0.45 * balance
+    conservative_score *= 0.60 + 0.40 * side_balance
+    conservative_score *= 0.45 + 0.55 * view_coverage
+    conservative_score *= 0.70 + 0.30 * magnitude_penalty
+    if dominant_view_share > 0.42:
+        conservative_score *= max(0.15, 1.0 - (dominant_view_share - 0.42) * 1.6)
+
     return {
         'roll_deg': float(cand_roll_deg),
         'pitch_deg': float(cand_pitch_deg),
-        'score': float(balanced_score),
+        'score': float(conservative_score),
         'raw_score': float(total_score),
         'horizontal_score': float(total_horizontal),
         'vertical_score': float(total_vertical),
         'balance': float(balance),
+        'side_score': float(side_score),
+        'front_back_score': float(front_back_score),
+        'side_balance': float(side_balance),
+        'effective_views': int(effective_views),
+        'view_coverage': float(view_coverage),
+        'dominant_view_share': float(dominant_view_share),
+        'magnitude_penalty': float(magnitude_penalty),
         'n_valid_views': int(n_valid_views),
         'n_lines': int(total_lines),
         'views': per_view,
@@ -923,9 +954,16 @@ def estimate_global_upright_roll_pitch(
     preview_h = max(256, int(round(preview_w / 2.0)))
     pano_preview = cv2.resize(pano_bgr, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
 
-    coarse_rolls = np.arange(-8.0, 8.01, 2.0)
-    coarse_pitches = np.arange(-6.0, 6.01, 2.0)
-    best = None
+    baseline = score_upright_candidate(
+        pano_preview,
+        yaw_center_deg=yaw_center_deg,
+        cand_roll_deg=0.0,
+        cand_pitch_deg=0.0,
+    )
+
+    coarse_rolls = np.arange(-5.0, 5.01, 1.0)
+    coarse_pitches = np.arange(-3.0, 3.01, 1.0)
+    best = dict(baseline)
     for roll_deg in coarse_rolls:
         for pitch_deg in coarse_pitches:
             cand = score_upright_candidate(
@@ -934,13 +972,12 @@ def estimate_global_upright_roll_pitch(
                 cand_roll_deg=float(roll_deg),
                 cand_pitch_deg=float(pitch_deg),
             )
-            if best is None or cand['score'] > best['score']:
+            if cand['score'] > best['score']:
                 best = cand
 
-    assert best is not None
-    refine_rolls = np.arange(best['roll_deg'] - 1.0, best['roll_deg'] + 1.01, 0.5)
-    refine_pitches = np.arange(best['pitch_deg'] - 1.0, best['pitch_deg'] + 1.01, 0.5)
-    refined_best = best
+    refine_rolls = np.arange(best['roll_deg'] - 0.5, best['roll_deg'] + 0.501, 0.25)
+    refine_pitches = np.arange(best['pitch_deg'] - 0.5, best['pitch_deg'] + 0.501, 0.25)
+    refined_best = dict(best)
     for roll_deg in refine_rolls:
         for pitch_deg in refine_pitches:
             cand = score_upright_candidate(
@@ -952,21 +989,35 @@ def estimate_global_upright_roll_pitch(
             if cand['score'] > refined_best['score']:
                 refined_best = cand
 
-    baseline = score_upright_candidate(
-        pano_preview,
-        yaw_center_deg=yaw_center_deg,
-        cand_roll_deg=0.0,
-        cand_pitch_deg=0.0,
-    )
+    best_before_fallback = dict(refined_best)
+    best_score = float(best_before_fallback['score'])
+    baseline_score = float(baseline['score'])
+    score_gain = float(best_score - baseline_score)
+    score_gain_ratio = (best_score / max(baseline_score, 1e-6)) if baseline_score > 0.0 else 1.0
 
     reason = 'applied'
-    if refined_best['n_valid_views'] < 2 or refined_best['n_lines'] < 24:
+    if best_before_fallback['n_valid_views'] < 3 or best_before_fallback['n_lines'] < 36:
         refined_best = baseline
         reason = 'fallback_insufficient_structure'
-    elif refined_best['score'] < baseline['score'] * 1.03:
+    elif best_before_fallback['effective_views'] < 3 or best_before_fallback['view_coverage'] < 0.38:
+        refined_best = baseline
+        reason = 'fallback_sparse_view_support'
+    elif best_before_fallback['balance'] < 0.16 or best_before_fallback['side_balance'] < 0.22:
+        refined_best = baseline
+        reason = 'fallback_axis_or_view_imbalance'
+    elif best_before_fallback['dominant_view_share'] > 0.46:
+        refined_best = baseline
+        reason = 'fallback_single_view_dominant'
+    elif abs(best_before_fallback['roll_deg']) > 4.0 or abs(best_before_fallback['pitch_deg']) > 2.5:
+        refined_best = baseline
+        reason = 'fallback_large_adjustment'
+    elif score_gain < max(120.0, baseline_score * 0.08):
         refined_best = baseline
         reason = 'fallback_low_gain'
-    elif abs(refined_best['roll_deg']) < 0.5 and abs(refined_best['pitch_deg']) < 0.5:
+    elif score_gain_ratio < 1.08:
+        refined_best = baseline
+        reason = 'fallback_low_gain_ratio'
+    elif abs(best_before_fallback['roll_deg']) < 0.5 and abs(best_before_fallback['pitch_deg']) < 0.5:
         refined_best = baseline
         reason = 'fallback_small_adjustment'
 
@@ -976,16 +1027,43 @@ def estimate_global_upright_roll_pitch(
         'horizontal_score': float(refined_best['horizontal_score']),
         'vertical_score': float(refined_best['vertical_score']),
         'balance': float(refined_best['balance']),
+        'side_score': float(refined_best.get('side_score', 0.0)),
+        'front_back_score': float(refined_best.get('front_back_score', 0.0)),
+        'side_balance': float(refined_best.get('side_balance', 0.0)),
+        'effective_views': int(refined_best.get('effective_views', 0)),
+        'view_coverage': float(refined_best.get('view_coverage', 0.0)),
+        'dominant_view_share': float(refined_best.get('dominant_view_share', 0.0)),
+        'magnitude_penalty': float(refined_best.get('magnitude_penalty', 0.0)),
         'n_valid_views': int(refined_best['n_valid_views']),
         'n_lines': int(refined_best['n_lines']),
+        'best_score': float(best_score),
+        'baseline_score': float(baseline_score),
+        'score_gain': float(score_gain),
+        'score_gain_ratio': float(score_gain_ratio),
         'coarse_best': {
             'roll_deg': float(best['roll_deg']),
             'pitch_deg': float(best['pitch_deg']),
             'score': float(best['score']),
         },
+        'best_before_fallback': {
+            'roll_deg': float(best_before_fallback['roll_deg']),
+            'pitch_deg': float(best_before_fallback['pitch_deg']),
+            'score': float(best_before_fallback['score']),
+            'balance': float(best_before_fallback['balance']),
+            'side_balance': float(best_before_fallback.get('side_balance', 0.0)),
+            'effective_views': int(best_before_fallback.get('effective_views', 0)),
+            'view_coverage': float(best_before_fallback.get('view_coverage', 0.0)),
+            'dominant_view_share': float(best_before_fallback.get('dominant_view_share', 0.0)),
+        },
         'baseline': {
             'score': float(baseline['score']),
             'raw_score': float(baseline['raw_score']),
+            'horizontal_score': float(baseline['horizontal_score']),
+            'vertical_score': float(baseline['vertical_score']),
+            'balance': float(baseline['balance']),
+            'side_balance': float(baseline.get('side_balance', 0.0)),
+            'effective_views': int(baseline.get('effective_views', 0)),
+            'view_coverage': float(baseline.get('view_coverage', 0.0)),
             'n_valid_views': int(baseline['n_valid_views']),
             'n_lines': int(baseline['n_lines']),
         },

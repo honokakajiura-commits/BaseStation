@@ -294,3 +294,91 @@ def test_estimate_global_upright_roll_pitch_falls_back_on_blank_pano():
     assert pitch_deg == 0.0
     assert reason in {'fallback_insufficient_structure', 'fallback_low_gain', 'fallback_small_adjustment'}
     assert meta['n_lines'] == 0
+
+
+
+def test_estimate_global_upright_roll_pitch_prefers_baseline_when_gain_is_small():
+    orig = mod.score_upright_candidate
+
+    def fake_score(*args, **kwargs):
+        roll_deg = float(kwargs['cand_roll_deg'])
+        pitch_deg = float(kwargs['cand_pitch_deg'])
+        score = 1000.0
+        if abs(roll_deg - 1.0) < 1e-6 and abs(pitch_deg) < 1e-6:
+            score = 1050.0
+        return {
+            'roll_deg': roll_deg,
+            'pitch_deg': pitch_deg,
+            'score': score,
+            'raw_score': score,
+            'horizontal_score': 500.0,
+            'vertical_score': 500.0,
+            'balance': 1.0,
+            'side_score': 500.0,
+            'front_back_score': 500.0,
+            'side_balance': 1.0,
+            'effective_views': 8,
+            'view_coverage': 1.0,
+            'dominant_view_share': 0.2,
+            'magnitude_penalty': 1.0,
+            'n_valid_views': 8,
+            'n_lines': 120,
+            'views': [],
+        }
+
+    mod.score_upright_candidate = fake_score
+    try:
+        pano = make_blank(width=2048, height=1024)
+        roll_deg, pitch_deg, reason, meta = mod.estimate_global_upright_roll_pitch(pano, yaw_center_deg=0.0)
+    finally:
+        mod.score_upright_candidate = orig
+
+    assert roll_deg == 0.0
+    assert pitch_deg == 0.0
+    assert reason in {'fallback_low_gain', 'fallback_low_gain_ratio'}
+    assert meta['baseline_score'] == 1000.0
+    assert meta['best_score'] == 1050.0
+    assert meta['score_gain'] == 50.0
+
+
+def test_estimate_global_upright_roll_pitch_rejects_large_adjustment():
+    orig = mod.score_upright_candidate
+
+    def fake_score(*args, **kwargs):
+        roll_deg = float(kwargs['cand_roll_deg'])
+        pitch_deg = float(kwargs['cand_pitch_deg'])
+        score = 1000.0
+        if abs(roll_deg - 5.0) < 1e-6 and abs(pitch_deg - 3.0) < 1e-6:
+            score = 2000.0
+        return {
+            'roll_deg': roll_deg,
+            'pitch_deg': pitch_deg,
+            'score': score,
+            'raw_score': score,
+            'horizontal_score': 1000.0,
+            'vertical_score': 1000.0,
+            'balance': 1.0,
+            'side_score': 1000.0,
+            'front_back_score': 1000.0,
+            'side_balance': 1.0,
+            'effective_views': 8,
+            'view_coverage': 1.0,
+            'dominant_view_share': 0.2,
+            'magnitude_penalty': 0.2,
+            'n_valid_views': 8,
+            'n_lines': 120,
+            'views': [],
+        }
+
+    mod.score_upright_candidate = fake_score
+    try:
+        pano = make_blank(width=2048, height=1024)
+        roll_deg, pitch_deg, reason, meta = mod.estimate_global_upright_roll_pitch(pano, yaw_center_deg=0.0)
+    finally:
+        mod.score_upright_candidate = orig
+
+    assert roll_deg == 0.0
+    assert pitch_deg == 0.0
+    assert reason == 'fallback_large_adjustment'
+    assert meta['best_before_fallback']['roll_deg'] == 5.0
+    assert meta['best_before_fallback']['pitch_deg'] == 3.0
