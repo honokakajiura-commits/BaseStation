@@ -34,6 +34,7 @@ import argparse
 import json
 import math
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Set
 from urllib.parse import urlparse
@@ -158,63 +159,129 @@ def is_image_url(u: str) -> bool:
     low = safe_str(u).lower()
     return low.endswith(".jpg") or low.endswith(".jpeg") or low.endswith(".png") or low.endswith(".webp")
 
-def choose_best_image_href_from_assets_dict(assets: Dict[str, Any]) -> Optional[str]:
-    candidates: List[Tuple[int, str]] = []
 
-    def score_asset(asset_key: str, a: Dict[str, Any]) -> int:
-        score = 0
-        key = safe_str(asset_key).lower()
-        roles = a.get("roles") or []
-        role_rank = 2
-        if isinstance(roles, list):
-            roles = [safe_str(r).lower() for r in roles]
-            if "thumbnail" in roles:
-                role_rank = 0
-            elif "data" in roles:
-                role_rank = 4
-            elif "visual" in roles:
-                role_rank = 3
-        score += role_rank * 100
+@dataclass
+class ImageAssetCandidate:
+    href: str
+    score: int
+    asset_key: str
+    roles: List[str]
+    mime_type: str
+    width: Optional[int]
+    height: Optional[int]
+    source: str
 
-        if key == "hd":
-            score += 80
-        elif key == "sd":
-            score += 20
-        elif key in {"thumb", "thumbnail"}:
-            score -= 200
 
-        typ = safe_str(a.get("type")).lower()
-        if "image/jpeg" in typ:
-            score += 5
-        if "image/webp" in typ:
-            score += 4
+@dataclass
+class CropViewSpec:
+    view: str
+    yaw_off_deg: float
+    fov_deg: float
 
-        href = safe_str(a.get("href"))
-        low_href = href.lower()
-        if "{z}" in href or "{x}" in href or "{y}" in href:
-            score -= 100
-        if "images/" in low_href:
-            score += 40
-        if "/sd." in low_href or low_href.endswith("/sd.jpg") or low_href.endswith("/sd.jpeg"):
-            score -= 40
-        if "/thumb" in low_href or low_href.endswith("/thumb.jpg") or low_href.endswith("/thumb.jpeg"):
-            score -= 200
-        if is_image_url(href):
-            score += 3
-        return score
 
+def _as_int_or_none(v: Any) -> Optional[int]:
+    try:
+        if v is None or safe_str(v) == "":
+            return None
+        return int(float(v))
+    except Exception:
+        return None
+
+
+def extract_asset_resolution(a: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+    width_keys = ["width", "w", "pixel_width", "image_width"]
+    height_keys = ["height", "h", "pixel_height", "image_height"]
+    width = None
+    height = None
+    for key in width_keys:
+        width = _as_int_or_none(a.get(key))
+        if width is not None:
+            break
+    for key in height_keys:
+        height = _as_int_or_none(a.get(key))
+        if height is not None:
+            break
+    return width, height
+
+
+def score_asset_candidate(asset_key: str, a: Dict[str, Any]) -> int:
+    score = 0
+    key = safe_str(asset_key).lower()
+    roles = a.get("roles") or []
+    role_rank = 2
+    if isinstance(roles, list):
+        roles = [safe_str(r).lower() for r in roles]
+        if "thumbnail" in roles:
+            role_rank = 0
+        elif "data" in roles:
+            role_rank = 4
+        elif "visual" in roles:
+            role_rank = 3
+    score += role_rank * 100
+
+    if key == "hd":
+        score += 140
+    elif key == "sd":
+        score += 10
+    elif key in {"thumb", "thumbnail"}:
+        score -= 250
+
+    typ = safe_str(a.get("type")).lower()
+    if "image/jpeg" in typ:
+        score += 5
+    if "image/webp" in typ:
+        score += 4
+
+    href = safe_str(a.get("href"))
+    low_href = href.lower()
+    if "{z}" in href or "{x}" in href or "{y}" in href:
+        score -= 100
+    if "images/" in low_href:
+        score += 40
+    if "/hd." in low_href or low_href.endswith("/hd.jpg") or low_href.endswith("/hd.jpeg"):
+        score += 80
+    if "/sd." in low_href or low_href.endswith("/sd.jpg") or low_href.endswith("/sd.jpeg"):
+        score -= 60
+    if "/thumb" in low_href or low_href.endswith("/thumb.jpg") or low_href.endswith("/thumb.jpeg"):
+        score -= 220
+    if is_image_url(href):
+        score += 3
+
+    width, height = extract_asset_resolution(a)
+    pixels = (width or 0) * (height or 0)
+    if pixels > 0:
+        score += min(120, pixels // 500_000)
+    return score
+
+
+def collect_asset_candidates_from_assets_dict(assets: Dict[str, Any], source: str) -> List[ImageAssetCandidate]:
+    candidates: List[ImageAssetCandidate] = []
     for asset_key, a in assets.items():
         if not isinstance(a, dict):
             continue
-        href = a.get("href")
-        if not isinstance(href, str) or not href:
+        href = safe_str(a.get("href"))
+        if not href:
             continue
-        candidates.append((score_asset(asset_key, a), href))
+        width, height = extract_asset_resolution(a)
+        roles = a.get("roles") or []
+        candidates.append(ImageAssetCandidate(
+            href=href,
+            score=score_asset_candidate(asset_key, a),
+            asset_key=safe_str(asset_key),
+            roles=[safe_str(r) for r in roles] if isinstance(roles, list) else [],
+            mime_type=safe_str(a.get("type")),
+            width=width,
+            height=height,
+            source=source,
+        ))
+    candidates.sort(key=lambda c: c.score, reverse=True)
+    return candidates
 
+def choose_best_image_href_from_assets_dict(assets: Dict[str, Any]) -> Optional[str]:
+    candidates = collect_asset_candidates_from_assets_dict(assets, source="assets_dict")
     if not candidates:
         return None
-    candidates.sort(key=lambda t: t[0], reverse=True)
-    return candidates[0][1]
+    return candidates[0].href
 
 def find_direct_image_url_from_feature(f: Dict[str, Any]) -> Optional[str]:
     assets = f.get("assets")
@@ -254,6 +321,14 @@ def choose_best_asset_href(item: Dict[str, Any]) -> Optional[str]:
         return None
     return choose_best_image_href_from_assets_dict(assets)
 
+
+def choose_best_asset_candidate(item_or_feature: Dict[str, Any], source: str) -> Optional[ImageAssetCandidate]:
+    assets = item_or_feature.get("assets")
+    if not isinstance(assets, dict):
+        return None
+    candidates = collect_asset_candidates_from_assets_dict(assets, source=source)
+    return candidates[0] if candidates else None
+
 def asset_info_from_assets_dict(assets: Any, img_url: str) -> Optional[Dict[str, Any]]:
     if not isinstance(assets, dict):
         return None
@@ -268,8 +343,67 @@ def asset_info_from_assets_dict(assets: Any, img_url: str) -> Optional[Dict[str,
                 "roles": a.get("roles") or [],
                 "type": safe_str(a.get("type")),
                 "title": safe_str(a.get("title")),
+                "width": extract_asset_resolution(a)[0],
+                "height": extract_asset_resolution(a)[1],
             }
     return None
+
+
+def resolve_best_panoramax_image(
+    session: requests.Session,
+    feature: Dict[str, Any],
+    timeout: int = 60,
+) -> Tuple[str, str, Optional[Dict[str, Any]]]:
+    item_url = normalize_url(find_item_url_from_feature(feature) or "")
+    direct_img_url = normalize_url(find_direct_image_url_from_feature(feature) or "")
+
+    best_feature_candidate = choose_best_asset_candidate(feature, source="feature_assets")
+    item = None
+    best_item_candidate = None
+    if item_url:
+        try:
+            item_resp = request_get_with_retry(session, item_url, timeout=min(timeout, 40), max_tries=4)
+            item = item_resp.json()
+            if isinstance(item, dict):
+                best_item_candidate = choose_best_asset_candidate(item, source="item_assets")
+        except Exception:
+            item = None
+            best_item_candidate = None
+
+    selected_candidate = None
+    if best_feature_candidate and best_item_candidate:
+        selected_candidate = max([best_feature_candidate, best_item_candidate], key=lambda c: c.score)
+    else:
+        selected_candidate = best_item_candidate or best_feature_candidate
+
+    if selected_candidate:
+        selected_asset = {
+            "asset_key": selected_candidate.asset_key,
+            "roles": selected_candidate.roles,
+            "type": selected_candidate.mime_type,
+            "width": selected_candidate.width,
+            "height": selected_candidate.height,
+            "source": selected_candidate.source,
+            "selection_score": selected_candidate.score,
+        }
+        return normalize_url(selected_candidate.href), selected_candidate.source, selected_asset
+
+    if direct_img_url:
+        selected_asset = asset_info_from_assets_dict(feature.get("assets"), direct_img_url) or {}
+        selected_asset.update({"source": "feature_direct", "selection_score": -1})
+        return direct_img_url, "feature_direct", selected_asset
+
+    if item_url:
+        resolved = resolve_image_url_via_item(session, item_url, timeout=timeout)
+        if resolved:
+            img_url = normalize_url(resolved)
+            selected_asset = {}
+            if isinstance(item, dict):
+                selected_asset = asset_info_from_assets_dict(item.get("assets"), img_url) or {}
+            selected_asset.update({"source": "item_resolved", "selection_score": -1})
+            return img_url, "item_resolved", selected_asset
+
+    raise RuntimeError("no direct image url and no item-resolved image url")
 
 def decode_image_size(img_bytes: bytes) -> Tuple[Optional[int], Optional[int]]:
     arr = np.frombuffer(img_bytes, dtype=np.uint8)
@@ -704,6 +838,118 @@ def equirectangular_to_perspective(
         interpolation=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_WRAP,
     )
+
+
+def get_cv_interpolation(name: str) -> int:
+    low = safe_str(name).lower()
+    if low == "nearest":
+        return cv2.INTER_NEAREST
+    if low == "cubic":
+        return cv2.INTER_CUBIC
+    if low == "lanczos":
+        return cv2.INTER_LANCZOS4
+    return cv2.INTER_LINEAR
+
+
+def get_crop_view_specs(
+    crop_strategy: str,
+    fov_front: float,
+    fov_side: float,
+    fov_back: float,
+) -> List[CropViewSpec]:
+    strategy = safe_str(crop_strategy).lower()
+    if strategy not in {"legacy", "ui_like"}:
+        raise ValueError(f"unsupported crop_strategy: {crop_strategy}")
+    return [
+        CropViewSpec("front", 0.0, float(fov_front)),
+        CropViewSpec("left", -90.0, float(fov_side)),
+        CropViewSpec("right", 90.0, float(fov_side)),
+        CropViewSpec("back", 180.0, float(fov_back)),
+    ]
+
+
+def render_panoramax_crop(
+    pano_bgr: np.ndarray,
+    yaw_deg: float,
+    pitch_deg: float,
+    fov_deg: float,
+    out_w: int,
+    out_h: int,
+    crop_strategy: str = "ui_like",
+    supersample: float = 1.0,
+    interpolation: str = "linear",
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    strategy = safe_str(crop_strategy).lower()
+    if strategy not in {"legacy", "ui_like"}:
+        raise ValueError(f"unsupported crop_strategy: {crop_strategy}")
+
+    remap_interp = cv2.INTER_LINEAR if strategy == "legacy" else get_cv_interpolation(interpolation)
+    ss = max(1.0, float(supersample))
+    render_w = int(round(out_w * ss))
+    render_h = int(round(out_h * ss))
+
+    h, w = pano_bgr.shape[:2]
+    fov = math.radians(fov_deg)
+    yaw = math.radians(yaw_deg)
+    pitch = math.radians(pitch_deg)
+
+    fx = (render_w / 2) / math.tan(fov / 2)
+    fy = fx
+    cx = render_w / 2
+    cy = render_h / 2
+
+    xs = np.arange(render_w)
+    ys = np.arange(render_h)
+    xv, yv = np.meshgrid(xs, ys)
+
+    x_cam = (xv - cx) / fx
+    y_cam = -(yv - cy) / fy
+    z_cam = np.ones_like(x_cam)
+
+    norm = np.sqrt(x_cam**2 + y_cam**2 + z_cam**2)
+    x_cam /= norm
+    y_cam /= norm
+    z_cam /= norm
+
+    cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+    cos_p, sin_p = math.cos(pitch), math.sin(pitch)
+
+    x1 = x_cam
+    y1 = cos_p * y_cam - sin_p * z_cam
+    z1 = sin_p * y_cam + cos_p * z_cam
+
+    x2 = cos_y * x1 + sin_y * z1
+    y2 = y1
+    z2 = -sin_y * x1 + cos_y * z1
+
+    lon = np.arctan2(x2, z2)
+    lat = np.arcsin(np.clip(y2, -1.0, 1.0))
+
+    u = (lon / (2 * math.pi) + 0.5) * w
+    v = (0.5 - lat / math.pi) * h
+
+    crop = cv2.remap(
+        pano_bgr,
+        u.astype(np.float32),
+        v.astype(np.float32),
+        interpolation=remap_interp,
+        borderMode=cv2.BORDER_WRAP,
+    )
+
+    if render_w != out_w or render_h != out_h:
+        crop = cv2.resize(crop, (out_w, out_h), interpolation=cv2.INTER_AREA)
+
+    meta = {
+        "strategy": strategy,
+        "supersample": float(ss),
+        "remap_interpolation": safe_str(interpolation if strategy != "legacy" else "linear"),
+        "render_size": [int(render_w), int(render_h)],
+        "output_size": [int(out_w), int(out_h)],
+        "fov_deg": float(fov_deg),
+        "yaw_deg": float(yaw_deg),
+        "pitch_deg": float(pitch_deg),
+    }
+    return crop, meta
 
 
 def _rotation_matrix_x(deg: float) -> np.ndarray:
@@ -1692,6 +1938,9 @@ def main():
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--crop_format", choices=["jpg", "png"], default="jpg")
     ap.add_argument("--crop_jpeg_quality", type=int, default=95)
+    ap.add_argument("--crop_strategy", choices=["legacy", "ui_like"], default="ui_like")
+    ap.add_argument("--crop_supersample", type=float, default=1.25)
+    ap.add_argument("--crop_interpolation", choices=["linear", "cubic", "lanczos", "nearest"], default="cubic")
     ap.add_argument("--log_selected_asset", action="store_true")
     ap.add_argument("--level_roll", action="store_true")
     ap.add_argument("--save_pre_roll_crop", action="store_true")
@@ -1756,33 +2005,12 @@ def main():
             skip_dl += 1
             continue
 
-        direct_img_url = find_direct_image_url_from_feature(f)
-        direct_img_url = normalize_url(direct_img_url) if direct_img_url else ""
-
-        item_url = find_item_url_from_feature(f)
-        item_url = normalize_url(item_url) if item_url else ""
-
         try:
-            selected_asset = None
-            selected_source = ""
-            if direct_img_url:
-                img_url = direct_img_url
-                selected_source = "feature_direct"
-                selected_asset = asset_info_from_assets_dict(f.get("assets"), img_url)
-            else:
-                if not item_url:
-                    raise RuntimeError("no direct image url and no item url")
-                resolved = resolve_image_url_via_item(session, item_url, timeout=args.timeout)
-                if not resolved:
-                    raise RuntimeError("cannot resolve image url via item")
-                img_url = normalize_url(resolved)
-                selected_source = "item_resolved"
-                try:
-                    item = request_get_with_retry(session, item_url, timeout=min(args.timeout, 40), max_tries=4).json()
-                    if isinstance(item, dict):
-                        selected_asset = asset_info_from_assets_dict(item.get("assets"), img_url)
-                except Exception:
-                    selected_asset = None
+            img_url, selected_source, selected_asset = resolve_best_panoramax_image(
+                session,
+                f,
+                timeout=args.timeout,
+            )
 
             img_bytes, pano_ext = download_image_bytes(session, img_url, timeout=args.timeout)
             dl_w, dl_h = decode_image_size(img_bytes)
@@ -1799,7 +2027,9 @@ def main():
                 print(
                     "[selected asset] "
                     f"fid={fid} source={selected_source} asset_key={asset_key} "
-                    f"roles={roles} url={img_url} downloaded_size={dl_w}x{dl_h}"
+                    f"roles={roles} url={img_url} downloaded_size={dl_w}x{dl_h} "
+                    f"asset_size={safe_str((selected_asset or {}).get('width'))}x{safe_str((selected_asset or {}).get('height'))} "
+                    f"score={safe_str((selected_asset or {}).get('selection_score'))}"
                 )
 
             if args.sleep > 0:
@@ -1915,24 +2145,30 @@ def main():
             "roll_meta": upright_meta,
         })
 
-        views = [
-            ("front", 0.0, args.fov_front),
-            ("left", -90.0, args.fov_side),
-            ("right", 90.0, args.fov_side),
-            ("back", 180.0, args.fov_back),
-        ]
+        views = get_crop_view_specs(
+            crop_strategy=args.crop_strategy,
+            fov_front=args.fov_front,
+            fov_side=args.fov_side,
+            fov_back=args.fov_back,
+        )
 
-        for view_name, yaw_off, fov in views:
+        for view_spec in views:
+            view_name = view_spec.view
+            yaw_off = view_spec.yaw_off_deg
+            fov = view_spec.fov_deg
             yaw = wrap_yaw_deg(yaw_center + yaw_off)
             raw_crop_path = ""
             if args.level_roll and args.save_pre_roll_crop:
-                raw_crop = equirectangular_to_perspective(
+                raw_crop, _ = render_panoramax_crop(
                     pano,
                     yaw_deg=yaw,
                     pitch_deg=pitch_deg,
                     fov_deg=fov,
                     out_w=args.det_w,
                     out_h=args.det_h,
+                    crop_strategy=args.crop_strategy,
+                    supersample=args.crop_supersample,
+                    interpolation=args.crop_interpolation,
                 )
                 raw_name = build_crop_name(
                     idx=i,
@@ -1948,13 +2184,16 @@ def main():
                 else:
                     cv2.imwrite(raw_crop_path, raw_crop, [int(cv2.IMWRITE_JPEG_QUALITY), int(args.crop_jpeg_quality)])
 
-            crop = equirectangular_to_perspective(
+            crop, crop_meta = render_panoramax_crop(
                 upright_pano,
                 yaw_deg=yaw,
                 pitch_deg=pitch_deg,
                 fov_deg=fov,
                 out_w=args.det_w,
                 out_h=args.det_h,
+                crop_strategy=args.crop_strategy,
+                supersample=args.crop_supersample,
+                interpolation=args.crop_interpolation,
             )
             roll_meta = {
                 "source": "upright_pano_before_crop",
@@ -2001,6 +2240,7 @@ def main():
                 "pitch_cli": float(args.pitch_cli),
                 "pitch_deg": float(pitch_deg),
                 "fov": float(fov),
+                "crop_meta": crop_meta,
                 "roll_deg": float(upright_roll_deg),
                 "roll_reason": upright_reason,
                 "roll_meta": roll_meta,
@@ -2040,6 +2280,9 @@ def main():
             "det_h": int(args.det_h),
             "crop_format": args.crop_format,
             "crop_jpeg_quality": int(args.crop_jpeg_quality),
+            "crop_strategy": args.crop_strategy,
+            "crop_supersample": float(args.crop_supersample),
+            "crop_interpolation": args.crop_interpolation,
             "fov_front": float(args.fov_front),
             "fov_side": float(args.fov_side),
             "fov_back": float(args.fov_back),

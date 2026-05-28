@@ -1,0 +1,7 @@
+path: /home/honoka/research/BaseStation/task_1_dataset_2026_04_19_19_19_55_yolo 1.1
+
+train: obj_train_data
+val: obj_train_data
+
+names:
+  0: base_station

@@ -62,6 +62,37 @@ def test_choose_best_image_href_uses_asset_key_fallback_without_roles():
     assert chosen == assets["hd"]["href"]
 
 
+def test_collect_asset_candidates_prefers_larger_item_even_when_feature_has_sd():
+    feature_assets = {
+        "sd": {"href": "https://example.com/derivates/full/sd.jpg", "type": "image/jpeg", "roles": ["visual"], "width": 2048, "height": 1024},
+    }
+    item_assets = {
+        "hd": {"href": "https://example.com/images/full.jpg", "type": "image/jpeg", "roles": ["data"], "width": 8000, "height": 4000},
+    }
+    feature_best = mod.collect_asset_candidates_from_assets_dict(feature_assets, source="feature")[0]
+    item_best = mod.collect_asset_candidates_from_assets_dict(item_assets, source="item")[0]
+    assert item_best.score > feature_best.score
+    assert item_best.href == item_assets["hd"]["href"]
+
+
+def test_render_panoramax_crop_keeps_output_shape_with_supersampling():
+    pano = make_blank(width=2048, height=1024)
+    crop, meta = mod.render_panoramax_crop(
+        pano,
+        yaw_deg=0.0,
+        pitch_deg=-20.0,
+        fov_deg=105.0,
+        out_w=640,
+        out_h=640,
+        crop_strategy="ui_like",
+        supersample=1.5,
+        interpolation="cubic",
+    )
+    assert crop.shape == (640, 640, 3)
+    assert meta["strategy"] == "ui_like"
+    assert meta["render_size"][0] > 640
+
+
 
 def test_estimate_roll_fallback_few_horizontal():
     img = make_blank()

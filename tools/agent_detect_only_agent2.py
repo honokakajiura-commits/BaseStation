@@ -24,6 +24,13 @@ import cv2
 import numpy as np
 import requests
 
+from make_yolo_crops_from_panoramax import (
+    download_image_bytes as panoramax_download_image_bytes,
+    fetch_picture_meta as panoramax_fetch_picture_meta,
+    render_panoramax_crop,
+    resolve_best_panoramax_image as resolve_best_panoramax_image_record,
+)
+
 
 # ----------------------------
 # IO utils
@@ -139,20 +146,56 @@ def _build_crop_name(
 # download (optional)
 # ----------------------------
 
-def download_pano(fid: str, dst: Path, image_base: str, session: requests.Session, retries: int = 5) -> bool:
-    if dst.exists() and dst.stat().st_size > 20_000:
-        return True
-    url = f"{image_base.rstrip('/')}/{fid}.jpg"
+def download_pano(
+    fid: str,
+    panos_dir: Path,
+    api_base: str,
+    image_base: str,
+    session: requests.Session,
+    retries: int = 5,
+) -> Tuple[bool, Optional[Path], dict]:
+    existing = find_pano_path(panos_dir, fid)
+    if existing is not None and existing.stat().st_size > 20_000:
+        return True, existing, {"source": "existing_local"}
+
+    last_err = ""
     for k in range(retries):
         try:
-            r = session.get(url, timeout=45)
+            item = panoramax_fetch_picture_meta(session, api_base=api_base, fid=fid, timeout=45)
+            img_url, selected_source, selected_asset = resolve_best_panoramax_image_record(
+                session,
+                item,
+                timeout=45,
+            )
+            img_bytes, ext = panoramax_download_image_bytes(session, img_url, timeout=45)
+            if len(img_bytes) <= 20_000:
+                raise RuntimeError(f"downloaded image too small: {len(img_bytes)} bytes")
+            dst = panos_dir / f"{fid}{ext}"
+            dst.write_bytes(img_bytes)
+            return True, dst, {
+                "source": selected_source,
+                "img_url": img_url,
+                "selected_asset": selected_asset,
+            }
+        except Exception as e:
+            last_err = safe_str(e)
+
+        legacy_url = f"{image_base.rstrip('/')}/{fid}.jpg"
+        try:
+            r = session.get(legacy_url, timeout=45)
             if r.status_code == 200 and len(r.content) > 20_000:
+                dst = panos_dir / f"{fid}.jpg"
                 dst.write_bytes(r.content)
-                return True
-        except Exception:
-            pass
+                return True, dst, {
+                    "source": "legacy_image_base",
+                    "img_url": legacy_url,
+                }
+        except Exception as e:
+            last_err = safe_str(e)
+
         time.sleep(0.6 * (k + 1))
-    return False
+
+    return False, None, {"error": last_err}
 
 
 # ----------------------------
@@ -217,6 +260,33 @@ def equirectangular_to_perspective(
     v = v.astype(np.float32)
 
     return cv2.remap(img_bgr, u, v, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
+
+
+def render_detection_crop(
+    pano_bgr: np.ndarray,
+    yaw_deg: float,
+    pitch_deg: float,
+    fov_deg: float,
+    out_w: int,
+    out_h: int,
+    crop_strategy: str,
+    supersample: float,
+    interpolation: str,
+) -> Tuple[np.ndarray, dict]:
+    crop, meta = render_panoramax_crop(
+        pano_bgr=pano_bgr,
+        yaw_deg=yaw_deg,
+        pitch_deg=pitch_deg,
+        fov_deg=fov_deg,
+        out_w=out_w,
+        out_h=out_h,
+        crop_strategy=crop_strategy,
+        supersample=supersample,
+        interpolation=interpolation,
+    )
+    if "remap_interpolation" in meta and "interpolation" not in meta:
+        meta["interpolation"] = meta["remap_interpolation"]
+    return crop, meta
 
 
 # ----------------------------
@@ -374,6 +444,9 @@ class AgentConfig:
     det_h: int = 1280
     fov_front: float = 105.0
     fov_side: float = 90.0
+    crop_strategy: str = "ui_like"
+    crop_supersample: float = 1.25
+    crop_interpolation: str = "cubic"
 
     zoom_min_fov: float = 50.0
     high_conf: float = 0.60
@@ -391,6 +464,9 @@ class AgentConfig:
 
     # ズーム後に bbox が切れないための角度余白（度）
     bbox_margin_deg: float = 3.0
+    recenter_pitch: bool = True
+    refine_zoom_ratio_small: float = 0.55
+    refine_zoom_ratio_medium: float = 0.75
 
     max_refine: int = 2
     yaw_side_deg: float = 90.0
@@ -471,6 +547,14 @@ def px_to_angle_deg(x_px: float, w: int, fov_deg: float) -> float:
     ang = math.atan((x_px - cx) / fx)
     return math.degrees(ang)
 
+
+def py_to_angle_deg(y_px: float, h: int, fov_deg: float) -> float:
+    cy = h / 2.0
+    fov = math.radians(fov_deg)
+    fy = (h / 2.0) / math.tan(fov / 2.0)
+    ang = math.atan((cy - y_px) / fy)
+    return math.degrees(ang)
+
 def bbox_lr_angles_deg(det: dict, w: int, fov_deg: float) -> Tuple[float, float]:
     x1, y1, x2, y2 = det["xyxy"]
     a1 = px_to_angle_deg(float(x1), w, fov_deg)
@@ -524,6 +608,23 @@ def yaw_delta_to_keep_bbox_in_next_fov(
     return float(-shift)
 
 
+def clamp_pitch_deg(pitch_deg: float, margin_deg: float = 1.0) -> float:
+    return max(-89.0 + margin_deg, min(89.0 - margin_deg, float(pitch_deg)))
+
+
+def draw_refine_compare(
+    before_img: np.ndarray,
+    before_dets: List[dict],
+    after_img: np.ndarray,
+    after_dets: List[dict],
+    before_lines: List[str],
+    after_lines: List[str],
+) -> np.ndarray:
+    left = draw_status(draw_annot(before_img, before_dets, topk=3), before_lines)
+    right = draw_status(draw_annot(after_img, after_dets, topk=3), after_lines)
+    return np.concatenate([left, right], axis=1)
+
+
 # ----------------------------
 # Main
 # ----------------------------
@@ -535,6 +636,7 @@ def main():
     ap.add_argument("--run_dir", required=True)
     ap.add_argument("--input_panos_dir", default="", help="(optional) panos dir; default: <run_dir>/panos")
 
+    ap.add_argument("--api_base", default="https://api.panoramax.xyz")
     ap.add_argument("--image_base", default="https://panoramax.openstreetmap.fr/images")
     ap.add_argument("--skip_download", action="store_true")
 
@@ -549,6 +651,9 @@ def main():
     ap.add_argument("--det_h", type=int, default=1280)
     ap.add_argument("--fov_front", type=float, default=105.0)
     ap.add_argument("--fov_side", type=float, default=90.0)
+    ap.add_argument("--crop_strategy", choices=["legacy", "ui_like"], default="ui_like")
+    ap.add_argument("--crop_supersample", type=float, default=1.25)
+    ap.add_argument("--crop_interpolation", choices=["linear", "cubic", "lanczos", "nearest"], default="cubic")
 
     ap.add_argument("--high_conf", type=float, default=0.60)
     ap.add_argument("--low_conf", type=float, default=0.20)
@@ -561,6 +666,9 @@ def main():
     ap.add_argument("--edge_center_margin", type=float, default=0.20)
     ap.add_argument("--zoom_safe_factor", type=float, default=0.90)
     ap.add_argument("--bbox_margin_deg", type=float, default=3.0)
+    ap.add_argument("--refine_zoom_ratio_small", type=float, default=0.55)
+    ap.add_argument("--refine_zoom_ratio_medium", type=float, default=0.75)
+    ap.add_argument("--disable_recenter_pitch", action="store_true")
 
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--overwrite", action="store_true")
@@ -579,11 +687,12 @@ def main():
 
     crops_dir = run_dir / "crops"
     ann_dir = run_dir / "annotated"
+    compare_dir = run_dir / "refine_compare"
     log_path = run_dir / "agent_log.jsonl"
     yaw_map_path = run_dir / "yaw_map.jsonl"
     summary_path = run_dir / "summary.json"
 
-    for d in [panos_dir, crops_dir, ann_dir]:
+    for d in [panos_dir, crops_dir, ann_dir, compare_dir]:
         ensure_dir(d)
 
     if args.overwrite:
@@ -607,8 +716,20 @@ def main():
         ok = fail = 0
         for r in index_recs:
             fid = r["fid"]
-            dst = panos_dir / f"{fid}.jpg"
-            if download_pano(fid, dst, args.image_base, sess):
+            dl_ok, _, dl_meta = download_pano(
+                fid=fid,
+                panos_dir=panos_dir,
+                api_base=args.api_base,
+                image_base=args.image_base,
+                session=sess,
+            )
+            append_jsonl(log_path, {
+                "step": "download",
+                "fid": fid,
+                "status": "ok" if dl_ok else "fail",
+                **dl_meta,
+            })
+            if dl_ok:
                 ok += 1
             else:
                 fail += 1
@@ -655,6 +776,9 @@ def main():
         det_h=args.det_h,
         fov_front=args.fov_front,
         fov_side=args.fov_side,
+        crop_strategy=args.crop_strategy,
+        crop_supersample=args.crop_supersample,
+        crop_interpolation=args.crop_interpolation,
         zoom_min_fov=args.zoom_min_fov,
         high_conf=args.high_conf,
         low_conf=args.low_conf,
@@ -663,6 +787,9 @@ def main():
         edge_center_margin=args.edge_center_margin,
         zoom_safe_factor=args.zoom_safe_factor,
         bbox_margin_deg=args.bbox_margin_deg,
+        recenter_pitch=not args.disable_recenter_pitch,
+        refine_zoom_ratio_small=args.refine_zoom_ratio_small,
+        refine_zoom_ratio_medium=args.refine_zoom_ratio_medium,
         max_refine=args.max_refine,
     )
 
@@ -701,18 +828,25 @@ def main():
         for view_name, yaw_off, fov0 in views:
             cur_yaw = wrap_yaw_deg(yaw_center + yaw_off)
             cur_fov = float(fov0)
+            cur_pitch = float(pitch_deg)
 
             last_yaw_delta = 0.0
             last_zoom = False
+            prev_crop: Optional[np.ndarray] = None
+            prev_dets: List[dict] = []
+            prev_state: Optional[dict] = None
 
             for step in range(cfg.max_refine + 1):
-                crop = equirectangular_to_perspective(
+                crop, crop_meta = render_detection_crop(
                     pano,
                     yaw_deg=cur_yaw,
-                    pitch_deg=pitch_deg,
+                    pitch_deg=cur_pitch,
                     fov_deg=cur_fov,
                     out_w=cfg.det_w,
                     out_h=cfg.det_h,
+                    crop_strategy=cfg.crop_strategy,
+                    supersample=cfg.crop_supersample,
+                    interpolation=cfg.crop_interpolation,
                 )
 
                 crop_name = _build_crop_name(
@@ -743,8 +877,9 @@ def main():
                     "yaw": float(cur_yaw),
                     "yaw_off": float(yaw_off),
                     "pitch_cli": float(args.pitch_cli),
-                    "pitch_deg": float(pitch_deg),
+                    "pitch_deg": float(cur_pitch),
                     "fov": float(cur_fov),
+                    "crop_meta": crop_meta,
                     "crop_path": str(crop_path),
                     "n": len(dets),
                     "best": bd,
@@ -762,7 +897,7 @@ def main():
                     msg_lines = [
                         "NO DETECTION after refine",
                         f"view={view_name} step={step}",
-                        f"yaw={cur_yaw:.1f} fov={cur_fov:.1f} pitch={pitch_deg:.1f}",
+                        f"yaw={cur_yaw:.1f} fov={cur_fov:.1f} pitch={cur_pitch:.1f}",
                     ]
                     ann0 = draw_status(crop, msg_lines)
                     ann_path0 = unique_path(ann_dir / crop_path.name, overwrite=args.overwrite)
@@ -788,6 +923,48 @@ def main():
                 ann_path = unique_path(ann_dir / crop_path.name, overwrite=args.overwrite)
                 cv2.imwrite(str(ann_path), ann)
 
+                cx_frac, cy_frac, area_frac = det_center_frac(bd, cfg.det_w, cfg.det_h)
+                bbox_cx = (bd["xyxy"][0] + bd["xyxy"][2]) / 2.0
+                bbox_cy = (bd["xyxy"][1] + bd["xyxy"][3]) / 2.0
+
+                if prev_crop is not None and prev_state is not None:
+                    compare_img = draw_refine_compare(
+                        before_img=prev_crop,
+                        before_dets=prev_dets,
+                        after_img=crop,
+                        after_dets=dets,
+                        before_lines=[
+                            f"before s={prev_state['step']} yaw={prev_state['yaw']:.1f} pitch={prev_state['pitch']:.1f}",
+                            f"fov={prev_state['fov']:.1f} center=({prev_state['center_frac'][0]:.2f},{prev_state['center_frac'][1]:.2f})",
+                        ],
+                        after_lines=[
+                            f"after s={step} yaw={cur_yaw:.1f} pitch={cur_pitch:.1f}",
+                            f"fov={cur_fov:.1f} conf={best_conf:.2f}",
+                        ],
+                    )
+                    compare_name = crop_path.stem + "__compare.jpg"
+                    compare_path = unique_path(compare_dir / compare_name, overwrite=args.overwrite)
+                    cv2.imwrite(str(compare_path), compare_img)
+                    append_jsonl(log_path, {
+                        "step": "refine_compare",
+                        "i": i,
+                        "fid": fid,
+                        "view": view_name,
+                        "from_s": prev_state["step"],
+                        "to_s": step,
+                        "compare_path": str(compare_path),
+                        "before_center_frac": prev_state["center_frac"],
+                        "before_center_xy": prev_state["center_xy"],
+                        "after_center_frac": [float(cx_frac), float(cy_frac)],
+                        "after_center_xy": [float(bbox_cx), float(bbox_cy)],
+                        "before_yaw": float(prev_state["yaw"]),
+                        "after_yaw": float(cur_yaw),
+                        "before_pitch": float(prev_state["pitch"]),
+                        "after_pitch": float(cur_pitch),
+                        "before_fov": float(prev_state["fov"]),
+                        "after_fov": float(cur_fov),
+                    })
+
                 if best_conf >= cfg.high_conf:
                     confirmed += 1
                     pano_confirmed += 1
@@ -801,14 +978,15 @@ def main():
                 candidates += 1
                 pano_candidate += 1
 
-                cx_frac, cy_frac, area_frac = det_center_frac(bd, cfg.det_w, cfg.det_h)
+                yaw_delta_center = px_to_angle_deg(bbox_cx, cfg.det_w, cur_fov)
+                pitch_delta_center = py_to_angle_deg(bbox_cy, cfg.det_h, cur_fov) if cfg.recenter_pitch else 0.0
 
                 # 1) ズーム計画（bboxが大きい時はズームしない）
                 next_fov = cur_fov
                 zoom = False
                 zoom_ratio = 1.0
                 if area_frac < cfg.large_area_frac:
-                    zoom_ratio = 0.55 if area_frac < cfg.small_area_frac else 0.75
+                    zoom_ratio = cfg.refine_zoom_ratio_small if area_frac < cfg.small_area_frac else cfg.refine_zoom_ratio_medium
                     next_fov = max(cfg.zoom_min_fov, cur_fov * zoom_ratio)
                     zoom = (next_fov != cur_fov)
 
@@ -852,17 +1030,32 @@ def main():
 
                 yaw_delta = 0.0
                 if need_center:
-                    # 端寄りなら中心に寄せる（従来）
-                    if center_by_edge or center_for_zoom:
-                        yaw_delta += yaw_adjust_from_px(cx_frac, cur_fov)
-                    # ズームで端が切れそうなら、角度ベースで追加補正
-                    yaw_delta += yaw_delta_keep
+                    yaw_delta = yaw_delta_center + yaw_delta_keep
+                pitch_delta = pitch_delta_center if need_center else 0.0
+
+                # bbox が中心からずれている時は、まず向きだけ直して次の周回でズームする。
+                # yaw 補正とズームを同時に掛けると、別の場所を拡大しやすい。
+                if zoom and need_center:
+                    next_fov = float(cur_fov)
+                    zoom = False
 
                 # 6) 変化がないなら打ち切り
-                if abs(yaw_delta) < 0.5 and not zoom:
+                if abs(yaw_delta) < 0.5 and abs(pitch_delta) < 0.5 and not zoom:
                     break
 
+                prev_crop = crop.copy()
+                prev_dets = list(dets)
+                prev_state = {
+                    "step": step,
+                    "yaw": float(cur_yaw),
+                    "pitch": float(cur_pitch),
+                    "fov": float(cur_fov),
+                    "center_frac": [float(cx_frac), float(cy_frac)],
+                    "center_xy": [float(bbox_cx), float(bbox_cy)],
+                }
+
                 cur_yaw = wrap_yaw_deg(cur_yaw + yaw_delta)
+                cur_pitch = clamp_pitch_deg(cur_pitch + pitch_delta)
                 cur_fov = float(next_fov)
 
                 last_yaw_delta = float(yaw_delta)
@@ -880,17 +1073,22 @@ def main():
                     "area_frac": float(area_frac),
                     "center_by_edge": bool(center_by_edge),
                     "center_for_zoom": bool(center_for_zoom),
+                    "yaw_delta_center": float(yaw_delta_center),
+                    "pitch_delta_center": float(pitch_delta_center),
                     "yaw_delta_keep": float(yaw_delta_keep),
                     "bbox_width_deg": float(bbox_width_deg),
                     "bbox_margin_deg": float(cfg.bbox_margin_deg),
                     "need_center": bool(need_center),
                     "yaw_delta": float(yaw_delta),
+                    "pitch_delta": float(pitch_delta),
                     "next_yaw": float(cur_yaw),
+                    "next_pitch": float(cur_pitch),
                     "cur_fov": float(cur_fov),
                     "next_fov": float(next_fov),
                     "zoom": bool(zoom),
                     "zoom_ratio_init": float(zoom_ratio),
                 })
+
 
         append_jsonl(log_path, {
             "step": "pano_done",
@@ -917,6 +1115,9 @@ def main():
             "det_h": cfg.det_h,
             "fov_front": cfg.fov_front,
             "fov_side": cfg.fov_side,
+            "crop_strategy": cfg.crop_strategy,
+            "crop_supersample": cfg.crop_supersample,
+            "crop_interpolation": cfg.crop_interpolation,
             "high_conf": cfg.high_conf,
             "low_conf": cfg.low_conf,
             "max_refine": cfg.max_refine,
@@ -926,15 +1127,20 @@ def main():
             "zoom_safe_factor": cfg.zoom_safe_factor,
             "bbox_margin_deg": cfg.bbox_margin_deg,
             "zoom_min_fov": cfg.zoom_min_fov,
+            "recenter_pitch": cfg.recenter_pitch,
+            "refine_zoom_ratio_small": cfg.refine_zoom_ratio_small,
+            "refine_zoom_ratio_medium": cfg.refine_zoom_ratio_medium,
             "weights": args.weights,
             "conf": float(args.conf),
             "imgsz": int(args.imgsz),
+            "api_base": args.api_base,
         },
         "paths": {
             "run_dir": str(run_dir),
             "yaw_map": str(yaw_map_path),
             "crops": str(crops_dir),
             "annotated": str(ann_dir),
+            "refine_compare": str(compare_dir),
             "log": str(log_path),
         }
     }
