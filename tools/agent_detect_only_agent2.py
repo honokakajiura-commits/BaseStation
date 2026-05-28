@@ -30,6 +30,10 @@ from make_yolo_crops_from_panoramax import (
     render_panoramax_crop,
     resolve_best_panoramax_image as resolve_best_panoramax_image_record,
 )
+from spherical_camera import (
+    compute_next_view_from_bbox,
+    equirect_to_perspective as spherical_equirect_to_perspective,
+)
 
 
 # ----------------------------
@@ -214,52 +218,17 @@ def equirectangular_to_perspective(
     out_h: int,
 ) -> np.ndarray:
     """Rectilinear projection. yaw:+right, pitch:+up."""
-    h, w = img_bgr.shape[:2]
-    fov = math.radians(fov_deg)
-    yaw = math.radians(yaw_deg)
-    pitch = math.radians(pitch_deg)
-
-    fx = (out_w / 2) / math.tan(fov / 2)
-    fy = fx
-    cx = out_w / 2
-    cy = out_h / 2
-
-    xs = np.arange(out_w)
-    ys = np.arange(out_h)
-    xv, yv = np.meshgrid(xs, ys)
-
-    x_cam = (xv - cx) / fx
-    y_cam = -(yv - cy) / fy  # 上下反転補正
-    z_cam = np.ones_like(x_cam)
-
-    norm = np.sqrt(x_cam**2 + y_cam**2 + z_cam**2)
-    x_cam /= norm
-    y_cam /= norm
-    z_cam /= norm
-
-    cos_y, sin_y = math.cos(yaw), math.sin(yaw)
-    cos_p, sin_p = math.cos(pitch), math.sin(pitch)
-
-    # pitch (X)
-    x1 = x_cam
-    y1 = cos_p * y_cam - sin_p * z_cam
-    z1 = sin_p * y_cam + cos_p * z_cam
-
-    # yaw (Y)
-    x2 = cos_y * x1 + sin_y * z1
-    y2 = y1
-    z2 = -sin_y * x1 + cos_y * z1
-
-    lon = np.arctan2(x2, z2)
-    lat = np.arcsin(np.clip(y2, -1.0, 1.0))
-
-    u = (lon / (2 * math.pi) + 0.5) * w
-    v = (0.5 - lat / math.pi) * h
-
-    u = u.astype(np.float32)
-    v = v.astype(np.float32)
-
-    return cv2.remap(img_bgr, u, v, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP)
+    return spherical_equirect_to_perspective(
+        img_bgr,
+        yaw=float(yaw_deg),
+        pitch=float(pitch_deg),
+        roll=0.0,
+        fov_x=float(fov_deg),
+        out_w=int(out_w),
+        out_h=int(out_h),
+        R_level=None,
+        interpolation=cv2.INTER_LINEAR,
+    )
 
 
 def render_detection_crop(
@@ -640,7 +609,7 @@ def main():
     ap.add_argument("--image_base", default="https://panoramax.openstreetmap.fr/images")
     ap.add_argument("--skip_download", action="store_true")
 
-    ap.add_argument("--pitch_cli", type=float, required=True, help="CLI pitch (up is negative)")
+    ap.add_argument("--pitch_cli", type=float, required=True, help="CLI pitch in degrees (positive is up)")
 
     ap.add_argument("--weights", required=True)
     ap.add_argument("--conf", type=float, default=0.20)
@@ -701,8 +670,8 @@ def main():
         if yaw_map_path.exists():
             yaw_map_path.unlink()
 
-    # pitch convention: crop expects +up, CLI is -up
-    pitch_deg = -float(args.pitch_cli)
+    # Internal pitch is positive upward. Keep the CLI conversion in one place.
+    pitch_deg = float(args.pitch_cli)
 
     index_recs = read_jsonl(aoi_index_path)
     if args.limit and args.limit > 0:
@@ -978,69 +947,43 @@ def main():
                 candidates += 1
                 pano_candidate += 1
 
-                yaw_delta_center = px_to_angle_deg(bbox_cx, cfg.det_w, cur_fov)
-                pitch_delta_center = py_to_angle_deg(bbox_cy, cfg.det_h, cur_fov) if cfg.recenter_pitch else 0.0
+                if step >= cfg.max_refine:
+                    break
 
-                # 1) ズーム計画（bboxが大きい時はズームしない）
-                next_fov = cur_fov
-                zoom = False
                 zoom_ratio = 1.0
                 if area_frac < cfg.large_area_frac:
                     zoom_ratio = cfg.refine_zoom_ratio_small if area_frac < cfg.small_area_frac else cfg.refine_zoom_ratio_medium
-                    next_fov = max(cfg.zoom_min_fov, cur_fov * zoom_ratio)
-                    zoom = (next_fov != cur_fov)
 
-                # 2) bbox幅が次FOVに収まらないなら、next_fovを「収まる程度まで」緩める
-                #    （それでも cur_fov と同じになったら実質ズームしない）
-                bbox_width_deg = 0.0
-                if zoom:
-                    next_fov, zoom, bbox_width_deg = fit_next_fov_to_bbox(
-                        cur_fov=cur_fov,
-                        next_fov=next_fov,
-                        det=bd,
-                        w=cfg.det_w,
-                        margin_deg=cfg.bbox_margin_deg,
-                    )
+                next_yaw, next_pitch, next_fov, debug_info = compute_next_view_from_bbox(
+                    bbox=bd,
+                    yaw=cur_yaw,
+                    pitch=cur_pitch,
+                    roll=0.0,
+                    fov_x=cur_fov,
+                    out_w=cfg.det_w,
+                    out_h=cfg.det_h,
+                    zoom_ratio=zoom_ratio,
+                    min_fov=cfg.zoom_min_fov,
+                    margin_deg=cfg.bbox_margin_deg,
+                    R_level=None,
+                )
+                if not cfg.recenter_pitch:
+                    next_pitch = float(cur_pitch)
+                    debug_info["next_pitch"] = float(next_pitch)
+                    debug_info["final_pitch"] = float(next_pitch)
+                    debug_info["pitch_delta"] = 0.0
+                    debug_info["recenter_pitch"] = False
+                else:
+                    debug_info["recenter_pitch"] = True
 
-                # 3) 中心寄せ判定（既存：端すぎるなら中心寄せ）
+                yaw_delta = wrap_yaw_deg(next_yaw - cur_yaw)
+                pitch_delta = float(next_pitch) - float(cur_pitch)
+                fov_delta = float(next_fov) - float(cur_fov)
+                zoom = bool(float(next_fov) < float(cur_fov) - 0.5)
                 center_by_edge = need_center_by_edge(cx_frac, cfg.edge_center_margin)
+                refine_action = safe_str(debug_info.get("refine_action"))
 
-                # 4) 追加：ズームしたら消えそうなら中心寄せ（粗い保険）
-                center_for_zoom = False
-                if zoom:
-                    center_for_zoom = need_center_before_zoom(
-                        cx_frac=cx_frac,
-                        cur_fov=cur_fov,
-                        next_fov=next_fov,
-                        safe_factor=cfg.zoom_safe_factor,
-                    )
-
-                # 5) 追加：角度ベースで「bbox左右端が次FOV内に収まる」ための yaw 補正
-                yaw_delta_keep = 0.0
-                if zoom:
-                    yaw_delta_keep = yaw_delta_to_keep_bbox_in_next_fov(
-                        det=bd,
-                        w=cfg.det_w,
-                        cur_fov=cur_fov,
-                        next_fov=next_fov,
-                        margin_deg=cfg.bbox_margin_deg,
-                    )
-
-                need_center = bool(center_by_edge or center_for_zoom or (abs(yaw_delta_keep) > 1e-6))
-
-                yaw_delta = 0.0
-                if need_center:
-                    yaw_delta = yaw_delta_center + yaw_delta_keep
-                pitch_delta = pitch_delta_center if need_center else 0.0
-
-                # bbox が中心からずれている時は、まず向きだけ直して次の周回でズームする。
-                # yaw 補正とズームを同時に掛けると、別の場所を拡大しやすい。
-                if zoom and need_center:
-                    next_fov = float(cur_fov)
-                    zoom = False
-
-                # 6) 変化がないなら打ち切り
-                if abs(yaw_delta) < 0.5 and abs(pitch_delta) < 0.5 and not zoom:
+                if abs(yaw_delta) < 0.5 and abs(pitch_delta) < 0.5 and abs(fov_delta) < 0.5:
                     break
 
                 prev_crop = crop.copy()
@@ -1054,13 +997,6 @@ def main():
                     "center_xy": [float(bbox_cx), float(bbox_cy)],
                 }
 
-                cur_yaw = wrap_yaw_deg(cur_yaw + yaw_delta)
-                cur_pitch = clamp_pitch_deg(cur_pitch + pitch_delta)
-                cur_fov = float(next_fov)
-
-                last_yaw_delta = float(yaw_delta)
-                last_zoom = bool(zoom)
-
                 append_jsonl(log_path, {
                     "step": "refine_plan",
                     "i": i,
@@ -1068,26 +1004,38 @@ def main():
                     "view": view_name,
                     "from_s": step,
                     "to_s": step + 1,
+                    "previous_yaw": float(cur_yaw),
+                    "previous_pitch": float(cur_pitch),
+                    "previous_fov": float(cur_fov),
                     "cx_frac": float(cx_frac),
                     "cy_frac": float(cy_frac),
                     "area_frac": float(area_frac),
                     "center_by_edge": bool(center_by_edge),
-                    "center_for_zoom": bool(center_for_zoom),
-                    "yaw_delta_center": float(yaw_delta_center),
-                    "pitch_delta_center": float(pitch_delta_center),
-                    "yaw_delta_keep": float(yaw_delta_keep),
-                    "bbox_width_deg": float(bbox_width_deg),
+                    "bbox_center": [float(bbox_cx), float(bbox_cy)],
                     "bbox_margin_deg": float(cfg.bbox_margin_deg),
-                    "need_center": bool(need_center),
+                    "target_yaw": float(debug_info["target_yaw"]),
+                    "target_pitch": float(debug_info["target_pitch"]),
                     "yaw_delta": float(yaw_delta),
                     "pitch_delta": float(pitch_delta),
-                    "next_yaw": float(cur_yaw),
-                    "next_pitch": float(cur_pitch),
-                    "cur_fov": float(cur_fov),
+                    "next_yaw": float(next_yaw),
+                    "next_pitch": float(next_pitch),
                     "next_fov": float(next_fov),
+                    "max_corner_angle": float(debug_info["max_corner_angle"]),
+                    "safe_fov": float(debug_info["safe_fov"]),
+                    "zoom_fov": float(debug_info["zoom_fov"]),
+                    "final_fov": float(debug_info["final_fov"]),
                     "zoom": bool(zoom),
                     "zoom_ratio_init": float(zoom_ratio),
+                    "refine_action": refine_action,
+                    "debug_info": debug_info,
                 })
+
+                cur_yaw = wrap_yaw_deg(next_yaw)
+                cur_pitch = clamp_pitch_deg(next_pitch)
+                cur_fov = float(next_fov)
+
+                last_yaw_delta = float(yaw_delta)
+                last_zoom = bool(zoom)
 
 
         append_jsonl(log_path, {

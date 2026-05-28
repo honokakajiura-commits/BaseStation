@@ -56,6 +56,7 @@ from make_yolo_crops_from_panoramax import (
     normalize_url,
     resolve_best_panoramax_image,
 )
+from spherical_camera import compute_next_view_from_bbox
 from panoramax_fetch_points_in_aoi import (
     extract_features,
     load_aoi_union,
@@ -597,7 +598,8 @@ def make_crops_stage(
 ) -> Dict[str, Any]:
     ensure_dir(crops_dir)
     rows = load_ordered_index(ordered_index)
-    pitch_deg = -float(pitch_cli)
+    # Internal pitch is positive upward. Keep the CLI conversion in one place.
+    pitch_deg = float(pitch_cli)
     yaw_map = ensure_yaw_map(
         ordered_rows=rows,
         panos_dir=panos_dir,
@@ -786,7 +788,8 @@ def detect_from_panos_stage(
     ensure_dir(compare_dir)
 
     rows = load_ordered_index(ordered_index)
-    pitch_deg = -float(pitch_cli)
+    # Internal pitch is positive upward. Keep the CLI conversion in one place.
+    pitch_deg = float(pitch_cli)
     yaw_map = ensure_yaw_map(
         ordered_rows=rows,
         panos_dir=panos_dir,
@@ -968,34 +971,45 @@ def detect_from_panos_stage(
 
                 candidates += 1
                 pano_candidate += 1
-                yaw_delta_center = px_to_angle_deg(bbox_cx, cfg.det_w, cur_fov)
-                pitch_delta_center = py_to_angle_deg(bbox_cy, cfg.det_h, cur_fov) if cfg.recenter_pitch else 0.0
 
-                prev_fov = float(cur_fov)
+                if step >= cfg.max_refine:
+                    break
+
                 center_by_edge = need_center_by_edge(cx_frac, cfg.edge_center_margin)
-                next_yaw = wrap_yaw_deg(cur_yaw + yaw_delta_center)
-                next_pitch = clamp_pitch_deg(cur_pitch + pitch_delta_center)
-                next_fov = float(cur_fov)
-                zoom = False
                 zoom_ratio = 1.0
-                refine_action = "recenter_only"
-
-                if center_by_edge:
-                    refine_action = "recenter_only_edge"
-                elif area_frac < cfg.large_area_frac:
+                if area_frac < cfg.large_area_frac:
                     zoom_ratio = cfg.refine_zoom_ratio_small if area_frac < cfg.small_area_frac else cfg.refine_zoom_ratio_medium
-                    next_fov = max(cfg.zoom_min_fov, cur_fov * zoom_ratio)
-                    zoom = next_fov != cur_fov
-                    if zoom:
-                        next_fov, zoom, _ = fit_next_fov_to_bbox(
-                            cur_fov=cur_fov,
-                            next_fov=next_fov,
-                            det=bd,
-                            w=cfg.det_w,
-                            margin_deg=cfg.bbox_margin_deg,
-                        )
-                    if zoom:
-                        refine_action = "recenter_and_zoom"
+
+                next_yaw, next_pitch, next_fov, debug_info = compute_next_view_from_bbox(
+                    bbox=bd,
+                    yaw=cur_yaw,
+                    pitch=cur_pitch,
+                    roll=0.0,
+                    fov_x=cur_fov,
+                    out_w=cfg.det_w,
+                    out_h=cfg.det_h,
+                    zoom_ratio=zoom_ratio,
+                    min_fov=cfg.zoom_min_fov,
+                    margin_deg=cfg.bbox_margin_deg,
+                    R_level=None,
+                )
+                if not cfg.recenter_pitch:
+                    next_pitch = float(cur_pitch)
+                    debug_info["next_pitch"] = float(next_pitch)
+                    debug_info["final_pitch"] = float(next_pitch)
+                    debug_info["pitch_delta"] = 0.0
+                    debug_info["recenter_pitch"] = False
+                else:
+                    debug_info["recenter_pitch"] = True
+
+                yaw_delta = wrap_yaw_deg(next_yaw - cur_yaw)
+                pitch_delta = float(next_pitch) - float(cur_pitch)
+                fov_delta = float(next_fov) - float(cur_fov)
+                zoom = bool(float(next_fov) < float(cur_fov) - 0.5)
+                refine_action = safe_str(debug_info.get("refine_action"))
+
+                if abs(yaw_delta) < 0.5 and abs(pitch_delta) < 0.5 and abs(fov_delta) < 0.5:
+                    break
 
                 append_stage_log(
                     log_path,
@@ -1004,16 +1018,27 @@ def detect_from_panos_stage(
                     input_file=str(crop_path),
                     params={"fid": fid, "view": view_name, "s": step},
                     refine_action=refine_action,
+                    previous_yaw=float(cur_yaw),
+                    previous_pitch=float(cur_pitch),
+                    previous_fov=float(cur_fov),
                     center_by_edge=bool(center_by_edge),
-                    yaw_delta_center=float(yaw_delta_center),
-                    pitch_delta_center=float(pitch_delta_center),
-                    prev_fov=float(prev_fov),
+                    bbox_center=[float(bbox_cx), float(bbox_cy)],
+                    target_yaw=float(debug_info["target_yaw"]),
+                    target_pitch=float(debug_info["target_pitch"]),
+                    next_yaw=float(next_yaw),
+                    next_pitch=float(next_pitch),
                     next_fov=float(next_fov),
+                    max_corner_angle=float(debug_info["max_corner_angle"]),
+                    safe_fov=float(debug_info["safe_fov"]),
+                    zoom_fov=float(debug_info["zoom_fov"]),
+                    final_fov=float(debug_info["final_fov"]),
+                    yaw_delta=float(yaw_delta),
+                    pitch_delta=float(pitch_delta),
+                    zoom=bool(zoom),
+                    zoom_ratio_init=float(zoom_ratio),
                     area_frac=float(area_frac),
+                    debug_info=debug_info,
                 )
-
-                if abs(yaw_delta_center) < 0.5 and abs(pitch_delta_center) < 0.5 and not zoom:
-                    break
 
                 prev_crop = crop.copy()
                 prev_dets = list(dets)
@@ -1026,10 +1051,10 @@ def detect_from_panos_stage(
                     "center_xy": [float(bbox_cx), float(bbox_cy)],
                 }
 
-                cur_yaw = next_yaw
-                cur_pitch = next_pitch
+                cur_yaw = wrap_yaw_deg(next_yaw)
+                cur_pitch = clamp_pitch_deg(next_pitch)
                 cur_fov = float(next_fov)
-                last_yaw_delta = float(yaw_delta_center)
+                last_yaw_delta = float(yaw_delta)
                 last_zoom = bool(zoom)
 
         append_stage_log(
@@ -1117,7 +1142,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--crop_strategy", choices=["legacy", "ui_like"], default="ui_like")
     ap.add_argument("--crop_supersample", type=float, default=1.25)
     ap.add_argument("--crop_interpolation", choices=["linear", "cubic", "lanczos", "nearest"], default="cubic")
-    ap.add_argument("--pitch_cli", type=float, default=40.0)
+    ap.add_argument("--pitch_cli", type=float, default=40.0, help="Pitch in degrees; positive is up")
     ap.add_argument("--hfov", type=float, default=105.0)
     ap.add_argument("--crop_width", type=int, default=1280)
     ap.add_argument("--crop_height", type=int, default=1280)

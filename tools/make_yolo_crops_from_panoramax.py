@@ -31,6 +31,7 @@ python tools/make_yolo_crops_from_panoramax.py \
 """
 
 import argparse
+import importlib.util
 import json
 import math
 import time
@@ -42,6 +43,17 @@ from urllib.parse import urlparse
 import cv2
 import numpy as np
 import requests
+
+try:
+    from spherical_camera import equirect_to_perspective as spherical_equirect_to_perspective
+except ModuleNotFoundError:
+    _SC_PATH = Path(__file__).resolve().with_name("spherical_camera.py")
+    _SC_SPEC = importlib.util.spec_from_file_location("spherical_camera", _SC_PATH)
+    if _SC_SPEC is None or _SC_SPEC.loader is None:
+        raise
+    _SC_MOD = importlib.util.module_from_spec(_SC_SPEC)
+    _SC_SPEC.loader.exec_module(_SC_MOD)
+    spherical_equirect_to_perspective = _SC_MOD.equirect_to_perspective
 
 
 # -------------------------
@@ -791,52 +803,16 @@ def equirectangular_to_perspective(
     out_w: int,
     out_h: int,
 ) -> np.ndarray:
-    h, w = img_bgr.shape[:2]
-    fov = math.radians(fov_deg)
-    yaw = math.radians(yaw_deg)
-    pitch = math.radians(pitch_deg)
-
-    fx = (out_w / 2) / math.tan(fov / 2)
-    fy = fx
-    cx = out_w / 2
-    cy = out_h / 2
-
-    xs = np.arange(out_w)
-    ys = np.arange(out_h)
-    xv, yv = np.meshgrid(xs, ys)
-
-    x_cam = (xv - cx) / fx
-    y_cam = -(yv - cy) / fy
-    z_cam = np.ones_like(x_cam)
-
-    norm = np.sqrt(x_cam**2 + y_cam**2 + z_cam**2)
-    x_cam /= norm
-    y_cam /= norm
-    z_cam /= norm
-
-    cos_y, sin_y = math.cos(yaw), math.sin(yaw)
-    cos_p, sin_p = math.cos(pitch), math.sin(pitch)
-
-    x1 = x_cam
-    y1 = cos_p * y_cam - sin_p * z_cam
-    z1 = sin_p * y_cam + cos_p * z_cam
-
-    x2 = cos_y * x1 + sin_y * z1
-    y2 = y1
-    z2 = -sin_y * x1 + cos_y * z1
-
-    lon = np.arctan2(x2, z2)
-    lat = np.arcsin(np.clip(y2, -1.0, 1.0))
-
-    u = (lon / (2 * math.pi) + 0.5) * w
-    v = (0.5 - lat / math.pi) * h
-
-    return cv2.remap(
+    return spherical_equirect_to_perspective(
         img_bgr,
-        u.astype(np.float32),
-        v.astype(np.float32),
+        yaw=float(yaw_deg),
+        pitch=float(pitch_deg),
+        roll=0.0,
+        fov_x=float(fov_deg),
+        out_w=int(out_w),
+        out_h=int(out_h),
+        R_level=None,
         interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_WRAP,
     )
 
 
@@ -888,52 +864,16 @@ def render_panoramax_crop(
     render_w = int(round(out_w * ss))
     render_h = int(round(out_h * ss))
 
-    h, w = pano_bgr.shape[:2]
-    fov = math.radians(fov_deg)
-    yaw = math.radians(yaw_deg)
-    pitch = math.radians(pitch_deg)
-
-    fx = (render_w / 2) / math.tan(fov / 2)
-    fy = fx
-    cx = render_w / 2
-    cy = render_h / 2
-
-    xs = np.arange(render_w)
-    ys = np.arange(render_h)
-    xv, yv = np.meshgrid(xs, ys)
-
-    x_cam = (xv - cx) / fx
-    y_cam = -(yv - cy) / fy
-    z_cam = np.ones_like(x_cam)
-
-    norm = np.sqrt(x_cam**2 + y_cam**2 + z_cam**2)
-    x_cam /= norm
-    y_cam /= norm
-    z_cam /= norm
-
-    cos_y, sin_y = math.cos(yaw), math.sin(yaw)
-    cos_p, sin_p = math.cos(pitch), math.sin(pitch)
-
-    x1 = x_cam
-    y1 = cos_p * y_cam - sin_p * z_cam
-    z1 = sin_p * y_cam + cos_p * z_cam
-
-    x2 = cos_y * x1 + sin_y * z1
-    y2 = y1
-    z2 = -sin_y * x1 + cos_y * z1
-
-    lon = np.arctan2(x2, z2)
-    lat = np.arcsin(np.clip(y2, -1.0, 1.0))
-
-    u = (lon / (2 * math.pi) + 0.5) * w
-    v = (0.5 - lat / math.pi) * h
-
-    crop = cv2.remap(
+    crop = spherical_equirect_to_perspective(
         pano_bgr,
-        u.astype(np.float32),
-        v.astype(np.float32),
+        yaw=float(yaw_deg),
+        pitch=float(pitch_deg),
+        roll=0.0,
+        fov_x=float(fov_deg),
+        out_w=int(render_w),
+        out_h=int(render_h),
+        R_level=None,
         interpolation=remap_interp,
-        borderMode=cv2.BORDER_WRAP,
     )
 
     if render_w != out_w or render_h != out_h:
@@ -1920,7 +1860,7 @@ def main():
     ap.add_argument("--api_base", default="https://api.panoramax.xyz")
     ap.add_argument("--meta_cache_jsonl", default="")
 
-    ap.add_argument("--pitch_cli", type=float, required=True, help="CLI pitch (up is negative)")
+    ap.add_argument("--pitch_cli", type=float, required=True, help="CLI pitch in degrees (positive is up)")
     ap.add_argument("--det_w", type=int, default=1280)
     ap.add_argument("--det_h", type=int, default=1280)
     ap.add_argument("--fov_front", type=float, default=105.0)
@@ -2039,7 +1979,7 @@ def main():
             fail_dl += 1
             print(f"[download fail] fid={fid}: {e}")
 
-    pitch_deg = -float(args.pitch_cli)
+    pitch_deg = float(args.pitch_cli)
     index_recs = read_jsonl(aoi_index_path)
 
     yaw_map = {}
