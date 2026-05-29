@@ -48,6 +48,10 @@ def classify_detection(best_det: Optional[dict], high_conf: float, low_conf: Opt
     return "refine"
 
 
+def need_center_by_edge(cx_frac: float, margin: float) -> bool:
+    return (float(cx_frac) < float(margin)) or (float(cx_frac) > 1.0 - float(margin))
+
+
 def compute_target_fov_by_bbox_area(
     current_fov: float,
     area_ratio: float,
@@ -171,4 +175,3 @@ def plan_refine_view(
         }
     )
     return float(yaw_next), float(pitch_next), next_fov, refine_action, debug_info
-

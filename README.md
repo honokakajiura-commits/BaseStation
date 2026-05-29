@@ -47,6 +47,20 @@
 
 既存 CLI の `--pitch_cli 40` は「上向き 40 度」を表す。内部でも pitch は上向きを正として扱う。
 
+## エージェントパッケージ構成
+エージェント中核処理は段階的に `tools/agent/` へ集約している。`tools/basestation_agent_complete.py` と
+`tools/agent_detect_only_agent2.py` は既存コマンド互換の CLI 入口として残す。
+
+- `tools/agent/config.py`: `AgentConfig`
+- `tools/agent/io_utils.py`: JSONL/JSON/CSV、path、ログ補助
+- `tools/agent/spherical_camera.py`: 全天球画像、3Dレイ、透視投影
+- `tools/agent/crop.py`: crop名生成、crop生成、視点設定
+- `tools/agent/detector.py`: YOLO推論、検出結果補助
+- `tools/agent/refine_policy.py`: 再探索方針、bbox面積比ベースのFOV制御
+- `tools/agent/visualize.py`: 検出描画、status、compare画像
+- `tools/agent/pipeline.py`: 今後の検出パイプライン本体の移動先
+- `tools/agent/geolocation.py`, `tools/agent/gis_export.py`: 位置推定・GIS出力の最小実装
+
 ## 現在の問題
 現在使用している YOLO 重みは国外データで学習されたものであり、日本国内の基地局に対してはドメインギャップがある。
 そのため、日本の基地局画像を用いた学習データセットを作成し、再学習または微調整する必要がある。

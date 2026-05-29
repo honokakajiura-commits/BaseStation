@@ -10,6 +10,10 @@ from typing import Any, Dict
 from .spherical_camera import bbox_center_to_world_ray, ray_to_yaw_pitch
 
 
+# TODO: Add triangulation / distance estimation once camera positions and
+# repeated observations are available in the pipeline.
+
+
 def ray_to_bearing_elevation(ray: Any) -> Dict[str, float]:
     yaw_deg, pitch_deg = ray_to_yaw_pitch(ray)
     return {"bearing_deg": float(yaw_deg), "elevation_deg": float(pitch_deg)}
@@ -34,4 +38,3 @@ def bbox_to_bearing_elevation(
         out_h=out_h,
     )
     return ray_to_bearing_elevation(ray)
-
