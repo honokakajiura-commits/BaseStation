@@ -31,9 +31,9 @@ python tools/make_yolo_crops_from_panoramax.py \
 """
 
 import argparse
-import importlib.util
 import json
 import math
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,16 +44,11 @@ import cv2
 import numpy as np
 import requests
 
-try:
-    from spherical_camera import equirect_to_perspective as spherical_equirect_to_perspective
-except ModuleNotFoundError:
-    _SC_PATH = Path(__file__).resolve().with_name("spherical_camera.py")
-    _SC_SPEC = importlib.util.spec_from_file_location("spherical_camera", _SC_PATH)
-    if _SC_SPEC is None or _SC_SPEC.loader is None:
-        raise
-    _SC_MOD = importlib.util.module_from_spec(_SC_SPEC)
-    _SC_SPEC.loader.exec_module(_SC_MOD)
-    spherical_equirect_to_perspective = _SC_MOD.equirect_to_perspective
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools.agent.spherical_camera import equirect_to_perspective as spherical_equirect_to_perspective
 
 
 # -------------------------

@@ -6,8 +6,8 @@ import cv2
 import numpy as np
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "tools" / "spherical_camera.py"
-spec = importlib.util.spec_from_file_location("spherical_camera", MODULE_PATH)
+MODULE_PATH = Path(__file__).resolve().parents[1] / "tools" / "agent" / "spherical_camera.py"
+spec = importlib.util.spec_from_file_location("tools.agent.spherical_camera", MODULE_PATH)
 sc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sc)
 
@@ -144,4 +144,3 @@ def test_compute_next_view_recenters_bbox_and_keeps_corners_visible():
         cu, cv = project_world_ray(corner_ray, next_yaw, next_pitch, next_fov, out_w, out_h)
         assert 0.0 <= cu <= out_w
         assert 0.0 <= cv <= out_h
-

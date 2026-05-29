@@ -8,38 +8,27 @@ python tools/test_spherical_camera.py --out_dir runs/spherical_camera_synthetic
 """
 
 import argparse
-import importlib.util
 import json
 import math
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-try:
-    from spherical_camera import (
-        apply_rotation_to_rays,
-        compute_next_view_from_bbox,
-        equirect_to_perspective,
-        make_rotation,
-        pixel_to_camera_ray,
-        wrap_yaw_deg,
-        yaw_pitch_to_ray,
-    )
-except ModuleNotFoundError:
-    _SC_PATH = Path(__file__).resolve().with_name("spherical_camera.py")
-    _SC_SPEC = importlib.util.spec_from_file_location("spherical_camera", _SC_PATH)
-    if _SC_SPEC is None or _SC_SPEC.loader is None:
-        raise
-    _SC_MOD = importlib.util.module_from_spec(_SC_SPEC)
-    _SC_SPEC.loader.exec_module(_SC_MOD)
-    apply_rotation_to_rays = _SC_MOD.apply_rotation_to_rays
-    compute_next_view_from_bbox = _SC_MOD.compute_next_view_from_bbox
-    equirect_to_perspective = _SC_MOD.equirect_to_perspective
-    make_rotation = _SC_MOD.make_rotation
-    pixel_to_camera_ray = _SC_MOD.pixel_to_camera_ray
-    wrap_yaw_deg = _SC_MOD.wrap_yaw_deg
-    yaw_pitch_to_ray = _SC_MOD.yaw_pitch_to_ray
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools.agent.spherical_camera import (
+    apply_rotation_to_rays,
+    equirect_to_perspective,
+    make_rotation,
+    pixel_to_camera_ray,
+    wrap_yaw_deg,
+    yaw_pitch_to_ray,
+)
+from tools.agent.refine_policy import plan_refine_view
 
 
 def equirect_uv(yaw_deg: float, pitch_deg: float, width: int, height: int) -> tuple[int, int]:
@@ -135,23 +124,23 @@ def main() -> int:
     before = equirect_to_perspective(pano, yaw=cur_yaw, pitch=cur_pitch, roll=0.0, fov_x=cur_fov, out_w=args.out_w, out_h=args.out_h)
     cv2.rectangle(before, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), (0, 255, 255), 2)
 
-    next_yaw, next_pitch, next_fov, debug = compute_next_view_from_bbox(
-        bbox=bbox,
+    next_yaw, next_pitch, next_fov, refine_action, debug = plan_refine_view(
+        det={"xyxy": bbox, "conf": 0.4},
         yaw=cur_yaw,
         pitch=cur_pitch,
         roll=0.0,
-        fov_x=cur_fov,
-        out_w=args.out_w,
-        out_h=args.out_h,
-        zoom_ratio=0.45,
+        current_fov=cur_fov,
+        image_w=args.out_w,
+        image_h=args.out_h,
         min_fov=20.0,
         margin_deg=4.0,
+        max_zoom_ratio=0.6,
     )
     after = equirect_to_perspective(pano, yaw=next_yaw, pitch=next_pitch, roll=0.0, fov_x=next_fov, out_w=args.out_w, out_h=args.out_h)
     cv2.drawMarker(after, (args.out_w // 2, args.out_h // 2), (0, 255, 255), markerType=cv2.MARKER_CROSS, markerSize=28, thickness=2)
 
     before_status = draw_status(before, [f"before yaw={cur_yaw:.1f} pitch={cur_pitch:.1f} fov={cur_fov:.1f}", f"bbox center=({bbox_cx:.1f},{bbox_cy:.1f})"])
-    after_status = draw_status(after, [f"after yaw={next_yaw:.1f} pitch={next_pitch:.1f} fov={next_fov:.1f}", f"action={debug['refine_action']}"])
+    after_status = draw_status(after, [f"after yaw={next_yaw:.1f} pitch={next_pitch:.1f} fov={next_fov:.1f}", f"action={refine_action}"])
     cv2.imwrite(str(out_dir / "refine_before.png"), before_status)
     cv2.imwrite(str(out_dir / "refine_after.png"), after_status)
     cv2.imwrite(str(out_dir / "refine_compare.png"), np.concatenate([before_status, after_status], axis=1))

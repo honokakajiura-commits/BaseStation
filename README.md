@@ -36,7 +36,7 @@
 - 検出信頼度に基づく再探索
 
 ## 全天球カメラの座標系
-`tools/spherical_camera.py` に全天球画像処理を集約している。
+`tools/agent/spherical_camera.py` に全天球画像処理を集約している。
 
 - 角度は度で扱う
 - 3D 座標は x が右、y が上、z が前

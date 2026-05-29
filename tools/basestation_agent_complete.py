@@ -5,12 +5,17 @@ import argparse
 import copy
 import csv
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import cv2
 import requests
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from agent_detect_only_agent2 import (
     AgentConfig,
@@ -26,18 +31,13 @@ from agent_detect_only_agent2 import (
     download_pano,
     ensure_dir,
     estimate_yaw_center_auto,
-    fit_next_fov_to_bbox,
-    need_center_before_zoom,
     need_center_by_edge,
-    px_to_angle_deg,
-    py_to_angle_deg,
     read_jsonl,
     render_detection_crop,
     safe_str,
     save_json,
     unique_path,
     wrap_yaw_deg,
-    yaw_delta_to_keep_bbox_in_next_fov,
 )
 from fetch_panos_ordered import (
     get_datetime_from_feature,
@@ -56,7 +56,7 @@ from make_yolo_crops_from_panoramax import (
     normalize_url,
     resolve_best_panoramax_image,
 )
-from spherical_camera import compute_next_view_from_bbox
+from tools.agent.refine_policy import plan_refine_view
 from panoramax_fetch_points_in_aoi import (
     extract_features,
     load_aoi_union,
@@ -976,37 +976,26 @@ def detect_from_panos_stage(
                     break
 
                 center_by_edge = need_center_by_edge(cx_frac, cfg.edge_center_margin)
-                zoom_ratio = 1.0
-                if area_frac < cfg.large_area_frac:
-                    zoom_ratio = cfg.refine_zoom_ratio_small if area_frac < cfg.small_area_frac else cfg.refine_zoom_ratio_medium
 
-                next_yaw, next_pitch, next_fov, debug_info = compute_next_view_from_bbox(
-                    bbox=bd,
+                next_yaw, next_pitch, next_fov, refine_action, debug_info = plan_refine_view(
+                    det=bd,
                     yaw=cur_yaw,
                     pitch=cur_pitch,
                     roll=0.0,
-                    fov_x=cur_fov,
-                    out_w=cfg.det_w,
-                    out_h=cfg.det_h,
-                    zoom_ratio=zoom_ratio,
+                    current_fov=cur_fov,
+                    image_w=cfg.det_w,
+                    image_h=cfg.det_h,
                     min_fov=cfg.zoom_min_fov,
                     margin_deg=cfg.bbox_margin_deg,
                     R_level=None,
+                    recenter_pitch=cfg.recenter_pitch,
+                    max_zoom_ratio=cfg.refine_zoom_ratio_small,
                 )
-                if not cfg.recenter_pitch:
-                    next_pitch = float(cur_pitch)
-                    debug_info["next_pitch"] = float(next_pitch)
-                    debug_info["final_pitch"] = float(next_pitch)
-                    debug_info["pitch_delta"] = 0.0
-                    debug_info["recenter_pitch"] = False
-                else:
-                    debug_info["recenter_pitch"] = True
 
                 yaw_delta = wrap_yaw_deg(next_yaw - cur_yaw)
                 pitch_delta = float(next_pitch) - float(cur_pitch)
                 fov_delta = float(next_fov) - float(cur_fov)
                 zoom = bool(float(next_fov) < float(cur_fov) - 0.5)
-                refine_action = safe_str(debug_info.get("refine_action"))
 
                 if abs(yaw_delta) < 0.5 and abs(pitch_delta) < 0.5 and abs(fov_delta) < 0.5:
                     break
@@ -1023,6 +1012,7 @@ def detect_from_panos_stage(
                     previous_fov=float(cur_fov),
                     center_by_edge=bool(center_by_edge),
                     bbox_center=[float(bbox_cx), float(bbox_cy)],
+                    bbox_area_ratio=float(debug_info["bbox_area_ratio"]),
                     target_yaw=float(debug_info["target_yaw"]),
                     target_pitch=float(debug_info["target_pitch"]),
                     next_yaw=float(next_yaw),
@@ -1031,11 +1021,12 @@ def detect_from_panos_stage(
                     max_corner_angle=float(debug_info["max_corner_angle"]),
                     safe_fov=float(debug_info["safe_fov"]),
                     zoom_fov=float(debug_info["zoom_fov"]),
+                    target_fov=float(debug_info["target_fov"]),
                     final_fov=float(debug_info["final_fov"]),
                     yaw_delta=float(yaw_delta),
                     pitch_delta=float(pitch_delta),
                     zoom=bool(zoom),
-                    zoom_ratio_init=float(zoom_ratio),
+                    zoom_ratio_init=float(debug_info["max_zoom_ratio"]),
                     area_frac=float(area_frac),
                     debug_info=debug_info,
                 )
