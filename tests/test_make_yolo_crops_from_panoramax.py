@@ -1,14 +1,7 @@
-import importlib.util
-from pathlib import Path
-
 import cv2
 import numpy as np
 
-
-MODULE_PATH = Path(__file__).resolve().parents[1] / "tools" / "make_yolo_crops_from_panoramax.py"
-spec = importlib.util.spec_from_file_location("make_yolo_crops_from_panoramax", MODULE_PATH)
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
+from tools.archive import make_yolo_crops_from_panoramax as mod
 
 
 def make_blank(width=1600, height=800):

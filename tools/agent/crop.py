@@ -8,9 +8,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple
 
+import cv2
 import numpy as np
 
-from tools.make_yolo_crops_from_panoramax import render_panoramax_crop
+from .spherical_camera import equirect_to_perspective
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,19 @@ def get_front_left_right_views(fov_front: float, fov_side: float, yaw_side_deg: 
     ]
 
 
+def get_cv_interpolation(name: str) -> int:
+    key = str(name or "").strip().lower()
+    if key == "nearest":
+        return cv2.INTER_NEAREST
+    if key == "linear":
+        return cv2.INTER_LINEAR
+    if key == "cubic":
+        return cv2.INTER_CUBIC
+    if key == "lanczos":
+        return cv2.INTER_LANCZOS4
+    raise ValueError(f"unsupported interpolation: {name}")
+
+
 def render_detection_crop(
     pano_bgr: np.ndarray,
     yaw_deg: float,
@@ -84,18 +98,40 @@ def render_detection_crop(
     supersample: float,
     interpolation: str,
 ) -> Tuple[np.ndarray, dict]:
-    crop, meta = render_panoramax_crop(
-        pano_bgr=pano_bgr,
-        yaw_deg=yaw_deg,
-        pitch_deg=pitch_deg,
-        fov_deg=fov_deg,
-        out_w=out_w,
-        out_h=out_h,
-        crop_strategy=crop_strategy,
-        supersample=supersample,
-        interpolation=interpolation,
-    )
-    if "remap_interpolation" in meta and "interpolation" not in meta:
-        meta["interpolation"] = meta["remap_interpolation"]
-    return crop, meta
+    strategy = str(crop_strategy or "").strip().lower()
+    if strategy not in {"legacy", "ui_like"}:
+        raise ValueError(f"unsupported crop_strategy: {crop_strategy}")
 
+    remap_interp = cv2.INTER_LINEAR if strategy == "legacy" else get_cv_interpolation(interpolation)
+    ss = max(1.0, float(supersample))
+    render_w = int(round(int(out_w) * ss))
+    render_h = int(round(int(out_h) * ss))
+
+    crop = equirect_to_perspective(
+        pano_bgr,
+        yaw=float(yaw_deg),
+        pitch=float(pitch_deg),
+        roll=0.0,
+        fov_x=float(fov_deg),
+        out_w=int(render_w),
+        out_h=int(render_h),
+        R_level=None,
+        interpolation=remap_interp,
+    )
+
+    if render_w != int(out_w) or render_h != int(out_h):
+        crop = cv2.resize(crop, (int(out_w), int(out_h)), interpolation=cv2.INTER_AREA)
+
+    remap_name = str(interpolation if strategy != "legacy" else "linear")
+    meta = {
+        "strategy": strategy,
+        "supersample": float(ss),
+        "remap_interpolation": remap_name,
+        "interpolation": remap_name,
+        "render_size": [int(render_w), int(render_h)],
+        "output_size": [int(out_w), int(out_h)],
+        "fov_deg": float(fov_deg),
+        "yaw_deg": float(yaw_deg),
+        "pitch_deg": float(pitch_deg),
+    }
+    return crop, meta

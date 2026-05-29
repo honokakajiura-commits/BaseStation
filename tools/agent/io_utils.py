@@ -39,6 +39,10 @@ def read_jsonl_if_exists(path: Path) -> List[dict]:
     return read_jsonl(path) if path.exists() else []
 
 
+def load_jsonl_records(path: Path) -> List[dict]:
+    return read_jsonl_if_exists(path)
+
+
 def write_jsonl_records(path: Path, rows: Iterable[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -46,9 +50,27 @@ def write_jsonl_records(path: Path, rows: Iterable[dict]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def write_featurecollection(path: Path, features: List[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"type": "FeatureCollection", "features": features}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
 def save_json(path: Path, obj: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def stage_enabled(run_flag: bool, skip_flag: bool, default: bool = True) -> bool:
+    if run_flag and skip_flag:
+        raise ValueError("conflicting stage flags")
+    if run_flag:
+        return True
+    if skip_flag:
+        return False
+    return default
 
 
 def save_csv(path: Path, rows: List[dict], preferred: List[str]) -> None:
@@ -90,6 +112,23 @@ def find_pano_path(panos_dir: Path, fid: str) -> Optional[Path]:
     return None
 
 
+def load_points_features(points_jsonl: Path) -> List[dict]:
+    return load_jsonl_records(points_jsonl)
+
+
+def load_images_map(images_jsonl: Path) -> Dict[str, dict]:
+    out: Dict[str, dict] = {}
+    for row in load_jsonl_records(images_jsonl):
+        fid = safe_str(row.get("fid"))
+        if fid:
+            out[fid] = row
+    return out
+
+
+def load_ordered_index(path: Path) -> List[dict]:
+    return load_jsonl_records(path)
+
+
 def append_stage_log(
     log_path: Path,
     step: str,
@@ -110,4 +149,3 @@ def append_stage_log(
     }
     rec.update(extra)
     append_jsonl(log_path, rec)
-

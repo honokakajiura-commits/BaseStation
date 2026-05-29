@@ -48,17 +48,22 @@
 既存 CLI の `--pitch_cli 40` は「上向き 40 度」を表す。内部でも pitch は上向きを正として扱う。
 
 ## エージェントパッケージ構成
-エージェント中核処理は段階的に `tools/agent/` へ集約している。`tools/basestation_agent_complete.py` と
-`tools/agent_detect_only_agent2.py` は既存コマンド互換の CLI 入口として残す。
+エージェント中核処理は `tools/agent/` へ集約している。`tools/basestation_agent_complete.py` は
+parser と `main()` だけを持つ薄い CLI 入口で、stage 本体は `tools.agent.*` を呼び出す。
+`tools/agent_detect_only_agent2.py` などの旧スクリプトは互換用 wrapper として残し、旧本体は
+`tools/archive/` に退避している。
 
 - `tools/agent/config.py`: `AgentConfig`
-- `tools/agent/io_utils.py`: JSONL/JSON/CSV、path、ログ補助
+- `tools/agent/io_utils.py`: JSONL/JSON/CSV、path、ログ補助、stage 共通I/O
 - `tools/agent/spherical_camera.py`: 全天球画像、3Dレイ、透視投影
 - `tools/agent/crop.py`: crop名生成、crop生成、視点設定
 - `tools/agent/detector.py`: YOLO推論、検出結果補助
 - `tools/agent/refine_policy.py`: 再探索方針、bbox面積比ベースのFOV制御
 - `tools/agent/visualize.py`: 検出描画、status、compare画像
-- `tools/agent/pipeline.py`: 今後の検出パイプライン本体の移動先
+- `tools/agent/panoramax_client.py`: Panoramax points/images 取得、pano download stage
+- `tools/agent/ordering.py`: sequence/datetime/nearest による pano ordering stage
+- `tools/agent/yaw.py`: yaw center 推定と yaw map 生成
+- `tools/agent/pipeline.py`: crop 生成、既存 crop 検出、pano からの再探索検出 stage
 - `tools/agent/geolocation.py`, `tools/agent/gis_export.py`: 位置推定・GIS出力の最小実装
 
 ## 現在の問題
