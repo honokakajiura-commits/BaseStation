@@ -39,6 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--skip_make_crops", action="store_true")
     ap.add_argument("--detect", action="store_true")
     ap.add_argument("--skip_detect", action="store_true")
+    ap.add_argument("--export_geojson", action="store_true")
+    ap.add_argument("--ray_length_m", type=float, default=100.0)
 
     ap.add_argument("--crop_strategy", choices=["legacy", "ui_like"], default="ui_like")
     ap.add_argument("--crop_supersample", type=float, default=1.25)
@@ -81,6 +83,7 @@ def main() -> None:
     yaw_map_path = run_dir / "yaw_map.jsonl"
     detections_jsonl = run_dir / "detections.jsonl"
     detections_csv = run_dir / "detections.csv"
+    geo_dir = run_dir / "geo"
     summary_path = run_dir / "summary.json"
     log_path = run_dir / "agent_log.jsonl"
 
@@ -124,6 +127,7 @@ def main() -> None:
             "compare_dir": str(compare_dir),
             "yaw_map": str(yaw_map_path),
             "detections_jsonl": str(detections_jsonl),
+            "geo_dir": str(geo_dir),
             "agent_log": str(log_path),
         },
     }
@@ -244,6 +248,23 @@ def main() -> None:
             detections_csv,
             detection_rows,
             preferred=["mode", "i", "fid", "view", "s", "crop_path", "annotated_path", "n", "best"],
+        )
+
+    if args.export_geojson:
+        if not detections_jsonl.exists():
+            raise ValueError(f"detections.jsonl not found: {detections_jsonl}")
+        if not ordered_index.exists():
+            raise ValueError(f"ordered_index not found: {ordered_index}")
+        from tools.agent.gis_export import export_detection_rays
+
+        summary["stages"]["export_geojson"] = export_detection_rays(
+            detections_jsonl=detections_jsonl,
+            ordered_index=ordered_index,
+            yaw_map=yaw_map_path,
+            out_dir=geo_dir,
+            image_w=args.crop_width,
+            image_h=args.crop_height,
+            ray_length_m=args.ray_length_m,
         )
 
     save_json(summary_path, summary)

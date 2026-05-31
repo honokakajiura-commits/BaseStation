@@ -64,7 +64,31 @@ parser と `main()` だけを持つ薄い CLI 入口で、stage 本体は `tools
 - `tools/agent/ordering.py`: sequence/datetime/nearest による pano ordering stage
 - `tools/agent/yaw.py`: yaw center 推定と yaw map 生成
 - `tools/agent/pipeline.py`: crop 生成、既存 crop 検出、pano からの再探索検出 stage
-- `tools/agent/geolocation.py`, `tools/agent/gis_export.py`: 位置推定・GIS出力の最小実装
+- `tools/agent/geolocation.py`: bbox中心から検出方向のローカル yaw/pitch と地理方位を計算
+- `tools/agent/gis_export.py`: ArcGIS確認用の camera points / detection rays GeoJSON 出力
+
+## Detection Ray GeoJSON
+検出済みの `detections.jsonl` と `aoi_index.jsonl` から、撮影地点と検出方向線を出力できる。
+`view_azimuth` がある場合は `view_azimuth + local_yaw` を地理方位として使い、ない場合は
+`azimuth_source=local_yaw_fallback` として local yaw を仮方位にする。
+
+```bash
+python tools/basestation_agent_complete.py \
+  --run_dir runs/test_50_agent \
+  --ordered_index runs/test_50_prepare/aoi_index_50.jsonl \
+  --skip_fetch_points \
+  --skip_fetch_images \
+  --skip_order_panos \
+  --skip_download_panos \
+  --skip_make_crops \
+  --skip_detect \
+  --export_geojson \
+  --ray_length_m 100
+```
+
+出力:
+- `run_dir/geo/camera_points.geojson`
+- `run_dir/geo/detection_rays.geojson`
 
 ## 現在の問題
 現在使用している YOLO 重みは国外データで学習されたものであり、日本国内の基地局に対してはドメインギャップがある。
