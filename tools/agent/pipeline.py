@@ -341,31 +341,29 @@ def detect_from_panos_stage(
 
                 dets = yolo.infer(crop)
                 bd = best_det(dets)
-                append_jsonl(
-                    detections_jsonl,
-                    {
-                        "mode": "pano_refine",
-                        "i": i,
-                        "fid": fid,
-                        "view": view_name,
-                        "s": step,
-                        "yaw_center": yaw_center,
-                        "yaw": float(cur_yaw),
-                        "yaw_off": float(yaw_off),
-                        "pitch_cli": float(pitch_cli),
-                        "pitch_deg": float(cur_pitch),
-                        "fov": float(cur_fov),
-                        "crop_meta": crop_meta,
-                        "crop_path": str(crop_path),
-                        "n": len(dets),
-                        "best": bd,
-                        "sequence_id": row.get("sequence_id", ""),
-                        "rank_in_collection": row.get("rank_in_collection", None),
-                    },
-                )
+                detection_row = {
+                    "mode": "pano_refine",
+                    "i": i,
+                    "fid": fid,
+                    "view": view_name,
+                    "s": step,
+                    "yaw_center": yaw_center,
+                    "yaw": float(cur_yaw),
+                    "yaw_off": float(yaw_off),
+                    "pitch_cli": float(pitch_cli),
+                    "pitch_deg": float(cur_pitch),
+                    "fov": float(cur_fov),
+                    "crop_meta": crop_meta,
+                    "crop_path": str(crop_path),
+                    "n": len(dets),
+                    "best": bd,
+                    "sequence_id": row.get("sequence_id", ""),
+                    "rank_in_collection": row.get("rank_in_collection", None),
+                }
 
                 if not bd:
                     if step == 0:
+                        append_jsonl(detections_jsonl, detection_row)
                         break
                     ann0 = draw_status(
                         crop,
@@ -377,6 +375,8 @@ def detect_from_panos_stage(
                     )
                     ann_path0 = unique_path(annotated_dir / crop_path.name, overwrite=overwrite)
                     cv2.imwrite(str(ann_path0), ann0)
+                    detection_row["annotated_path"] = str(ann_path0)
+                    append_jsonl(detections_jsonl, detection_row)
                     append_stage_log(
                         log_path,
                         step="refine_lost",
@@ -391,6 +391,8 @@ def detect_from_panos_stage(
                 ann = draw_annot(crop, dets, topk=3)
                 ann_path = unique_path(annotated_dir / crop_path.name, overwrite=overwrite)
                 cv2.imwrite(str(ann_path), ann)
+                detection_row["annotated_path"] = str(ann_path)
+                append_jsonl(detections_jsonl, detection_row)
 
                 cx_frac, cy_frac, area_frac = det_center_frac(bd, cfg.det_w, cfg.det_h)
                 bbox_cx = (bd["xyxy"][0] + bd["xyxy"][2]) / 2.0

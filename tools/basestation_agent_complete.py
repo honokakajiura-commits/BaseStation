@@ -41,6 +41,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--skip_detect", action="store_true")
     ap.add_argument("--export_geojson", action="store_true")
     ap.add_argument("--ray_length_m", type=float, default=100.0)
+    ap.add_argument("--arcgis_annotated_dir", default="")
+    ap.add_argument("--arcgis_windows_annotated_dir", default="")
 
     ap.add_argument("--crop_strategy", choices=["legacy", "ui_like"], default="ui_like")
     ap.add_argument("--crop_supersample", type=float, default=1.25)
@@ -265,6 +267,8 @@ def main() -> None:
             image_w=args.crop_width,
             image_h=args.crop_height,
             ray_length_m=args.ray_length_m,
+            arcgis_annotated_dir=Path(args.arcgis_annotated_dir) if args.arcgis_annotated_dir else None,
+            arcgis_windows_annotated_dir=args.arcgis_windows_annotated_dir or None,
         )
 
     save_json(summary_path, summary)

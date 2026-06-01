@@ -67,10 +67,12 @@ parser と `main()` だけを持つ薄い CLI 入口で、stage 本体は `tools
 - `tools/agent/geolocation.py`: bbox中心から検出方向のローカル yaw/pitch と地理方位を計算
 - `tools/agent/gis_export.py`: ArcGIS確認用の camera points / detection rays GeoJSON 出力
 
-## Detection Ray GeoJSON
-検出済みの `detections.jsonl` と `aoi_index.jsonl` から、撮影地点と検出方向線を出力できる。
+## ArcGIS確認用出力
+検出済みの `detections.jsonl` と `aoi_index.jsonl` から、撮影地点、検出方向線、確認用 observation point、
+annotated 画像添付テーブルを出力できる。
 `view_azimuth` がある場合は `view_azimuth + local_yaw` を地理方位として使い、ない場合は
 `azimuth_source=local_yaw_fallback` として local yaw を仮方位にする。
+Google My Maps 由来の基地局点やGoogle写真とは関連付けない。
 
 ```bash
 python tools/basestation_agent_complete.py \
@@ -83,12 +85,37 @@ python tools/basestation_agent_complete.py \
   --skip_make_crops \
   --skip_detect \
   --export_geojson \
-  --ray_length_m 100
+  --ray_length_m 100 \
+  --arcgis_annotated_dir data/arcgis_detection_annotated \
+  --arcgis_windows_annotated_dir "C:\Users\kajiura\Desktop\arcGIS_data\detection_annotated"
 ```
 
 出力:
+- `run_dir/geo/camera_points.csv`
 - `run_dir/geo/camera_points.geojson`
+- `run_dir/geo/detection_rays.csv`
 - `run_dir/geo/detection_rays.geojson`
+- `run_dir/geo/detection_observation_points.csv`
+- `run_dir/geo/detection_observation_points.geojson`
+- `run_dir/geo/detection_annotated_attachments.csv`
+- `run_dir/geo/detection_annotated_attachments_windows.csv`
+
+`detection_rays.csv` には `conf`、`conf_class`、`refine_status`、`is_refined`、`ray_id`、
+`annotated_path` を出力する。`conf_class` は `high`、`medium`、`low` で、初期しきい値は
+`high >= 0.60`、`medium >= 0.30`。`refine_status` は初回cropを `initial`、再探索後cropを
+`refined`、判定不能を `unknown` とする。
+
+`--arcgis_annotated_dir` を指定した場合だけ annotated 画像をコピーし、コピー名は
+`ray_id_annotated.jpg` にする。未指定の場合は既存の annotated 画像パスを添付CSVに出力する。
+
+ArcGIS Proでの確認手順:
+1. `detection_rays.csv` を XY To Line で線にする
+2. `conf_class` で線色を分類する
+3. `detection_observation_points.csv` を XY Table To Point で点にする
+4. `refine_status` または `is_refined` で点記号を分類する
+5. `detection_observation_points` に Enable Attachments を実行する
+6. Add Attachments で `detection_annotated_attachments_windows.csv` を使う
+7. ポップアップで Attachments を Preview 表示する
 
 ## 現在の問題
 現在使用している YOLO 重みは国外データで学習されたものであり、日本国内の基地局に対してはドメインギャップがある。

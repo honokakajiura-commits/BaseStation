@@ -6,12 +6,20 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Any, Dict, Optional, Tuple
 
 from .spherical_camera import bbox_center_to_world_ray, ray_to_yaw_pitch
 
 
 EARTH_RADIUS_M = 6371008.8
+DEFAULT_CONF_HIGH_THRESHOLD = 0.60
+DEFAULT_CONF_MEDIUM_THRESHOLD = 0.30
+DEFAULT_OBSERVATION_OFFSET_M = 5.0
+_REFINED_TEXT_TOKENS = ("refine", "refined", "retry", "recenter", "zoom")
+_INITIAL_TEXT_TOKENS = ("initial", "init")
+_NORMAL_INITIAL_VIEWS = {"front", "left", "right"}
+_SAFE_ID_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def wrap360(deg: float) -> float:
@@ -120,6 +128,124 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
+def classify_confidence(
+    conf: Any,
+    high_threshold: float = DEFAULT_CONF_HIGH_THRESHOLD,
+    medium_threshold: float = DEFAULT_CONF_MEDIUM_THRESHOLD,
+) -> str:
+    """Classify detection confidence for ArcGIS symbol rules."""
+    value = _safe_float(conf)
+    if value is None:
+        return "unknown"
+    if value >= float(high_threshold):
+        return "high"
+    if value >= float(medium_threshold):
+        return "medium"
+    return "low"
+
+
+def _safe_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "refined"}:
+        return True
+    if text in {"0", "false", "no", "n", "initial"}:
+        return False
+    return None
+
+
+def _text_has_any(value: Any, tokens: Tuple[str, ...]) -> bool:
+    text = str(value or "").strip().lower()
+    return bool(text) and any(token in text for token in tokens)
+
+
+def _refine_status_from_step(step: Any) -> Optional[str]:
+    if step is None or step == "":
+        return None
+    numeric = _safe_float(step)
+    if numeric is not None:
+        return "refined" if numeric > 0 else "initial"
+    if _text_has_any(step, _REFINED_TEXT_TOKENS):
+        return "refined"
+    if _text_has_any(step, _INITIAL_TEXT_TOKENS):
+        return "initial"
+    return None
+
+
+def _refine_status_from_crop_path(crop_path: Any) -> Optional[str]:
+    text = str(crop_path or "").strip().lower()
+    if not text:
+        return None
+    if _text_has_any(text, _REFINED_TEXT_TOKENS):
+        return "refined"
+
+    match = re.search(r"(?:^|__)r(\d+)(?:__|\.|$)", text)
+    if match:
+        return "refined" if int(match.group(1)) > 0 else "initial"
+    if "__actinit" in text:
+        return "initial"
+    return None
+
+
+def infer_refine_status(row: Dict[str, Any]) -> str:
+    """Infer whether a detection came from the initial or refined crop."""
+    explicit = str(row.get("refine_status") or "").strip().lower()
+    if explicit in {"initial", "refined", "unknown"}:
+        return explicit
+
+    if "is_refined" in row:
+        refined = _safe_bool(row.get("is_refined"))
+        if refined is not None:
+            return "refined" if refined else "initial"
+
+    for key in ("refine_action", "retry_action", "recenter_action"):
+        value = row.get(key)
+        text = str(value or "").strip().lower()
+        if text and text not in {"none", "false", "0", "initial"}:
+            return "refined"
+
+    step = row.get("step")
+    if step in (None, ""):
+        step = row.get("s")
+    status = _refine_status_from_step(step)
+    if status:
+        return status
+
+    status = _refine_status_from_crop_path(row.get("crop_path"))
+    if status:
+        return status
+
+    view = str(row.get("view") or "").strip().lower()
+    if view in _NORMAL_INITIAL_VIEWS:
+        return "initial"
+    return "unknown"
+
+
+def is_refined_value(status: str) -> int:
+    """Return an ArcGIS-friendly 0/1 flag from a refine status."""
+    return 1 if str(status or "").strip().lower() == "refined" else 0
+
+
+def safe_id(value: Any, max_length: int = 120) -> str:
+    """Return a stable filename-safe identifier."""
+    text = str(value or "").strip()
+    text = _SAFE_ID_RE.sub("_", text)
+    text = re.sub(r"_+", "_", text).strip("._-")
+    if not text:
+        return "ray"
+    text = text[: int(max_length)].rstrip("._-")
+    return text or "ray"
+
+
+def make_ray_id(fid: Any, view: Any, step: Any, index: int) -> str:
+    return safe_id(f"{fid}_{view}_{step}_{index}")
+
+
 def _row_lon_lat(row: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
     lon = _safe_float(row.get("lon"))
     lat = _safe_float(row.get("lat"))
@@ -198,12 +324,19 @@ def make_detection_ray_record(
     end_lon, end_lat = project_point(camera_lon, camera_lat, geo_azimuth, ray_length_m)
     cx, cy = bbox_center_xy(det)
     conf = _safe_float(det.get("conf") if isinstance(det, dict) else None)
+    step = detection.get("s")
+    if step in (None, ""):
+        step = detection.get("step", "")
+    refine_status = infer_refine_status(detection)
 
     return {
         "fid": fid,
         "view": detection.get("view", ""),
-        "step": detection.get("s", detection.get("step", "")),
+        "step": step,
         "conf": conf,
+        "conf_class": classify_confidence(conf),
+        "refine_status": refine_status,
+        "is_refined": is_refined_value(refine_status),
         "local_yaw": float(local_yaw),
         "local_pitch": float(local_pitch),
         "geo_azimuth": float(geo_azimuth),
@@ -220,8 +353,50 @@ def make_detection_ray_record(
         "crop_pitch": float(pitch),
         "crop_fov": float(fov),
         "bbox_center": [float(cx), float(cy)],
+        "start_lon": float(camera_lon),
+        "start_lat": float(camera_lat),
         "camera_lon": float(camera_lon),
         "camera_lat": float(camera_lat),
         "end_lon": float(end_lon),
         "end_lat": float(end_lat),
     }
+
+
+def make_observation_point_record(
+    ray_record: Dict[str, Any],
+    offset_m: float = DEFAULT_OBSERVATION_OFFSET_M,
+) -> Dict[str, Any]:
+    """Create the ArcGIS click target point for a detection ray."""
+    lon, lat = project_point(
+        lon=float(ray_record["camera_lon"]),
+        lat=float(ray_record["camera_lat"]),
+        azimuth_deg=float(ray_record["geo_azimuth"]),
+        distance_m=float(offset_m),
+    )
+    keys = [
+        "ray_id",
+        "fid",
+        "view",
+        "step",
+        "camera_lon",
+        "camera_lat",
+        "end_lon",
+        "end_lat",
+        "conf",
+        "conf_class",
+        "refine_status",
+        "is_refined",
+        "local_yaw",
+        "local_pitch",
+        "geo_azimuth",
+        "elevation",
+        "azimuth_source",
+        "crop_path",
+        "annotated_path",
+        "sequence_id",
+        "rank_in_collection",
+    ]
+    out = {key: ray_record.get(key, "") for key in keys}
+    out["lon"] = float(lon)
+    out["lat"] = float(lat)
+    return out
