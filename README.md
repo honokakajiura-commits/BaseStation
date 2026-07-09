@@ -67,6 +67,29 @@ parser と `main()` だけを持つ薄い CLI 入口で、stage 本体は `tools
 - `tools/agent/geolocation.py`: bbox中心から検出方向のローカル yaw/pitch と地理方位を計算
 - `tools/agent/gis_export.py`: ArcGIS確認用の camera points / detection rays GeoJSON 出力
 
+## 開発ルール：大きな変更前の GitHub 退避
+
+本プロジェクトでは、agent の挙動に影響する大きな変更を行う前に、必ず現在の状態を GitHub に push する。
+
+特に以下の変更を行う場合は、作業前に commit / push すること。
+
+- crop 生成方法の変更
+- yaw / pitch / roll / R_level など座標変換の変更
+- 再探索処理の変更
+- bbox 中心から ray / 方位角を計算する処理の変更
+- GIS 出力の変更
+- config のデフォルト値変更
+- pipeline 全体に影響する処理の追加
+
+作業前の基本手順:
+
+```bash
+git status
+git add .
+git commit -m "Save current state before major change"
+git push
+```
+
 ## ArcGIS確認用出力
 検出済みの `detections.jsonl` と `aoi_index.jsonl` から、撮影地点、検出方向線、確認用 observation point、
 annotated 画像添付テーブルを出力できる。

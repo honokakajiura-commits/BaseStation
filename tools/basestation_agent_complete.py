@@ -51,8 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--hfov", type=float, default=105.0)
     ap.add_argument("--crop_width", type=int, default=1280)
     ap.add_argument("--crop_height", type=int, default=1280)
-    ap.add_argument("--level_horizon", dest="level_horizon", action="store_true", default=True)
-    ap.add_argument("--no_level_horizon", dest="level_horizon", action="store_false")
+    ap.add_argument("--level_method", choices=["none", "spherical_ransac"], default="none")
     ap.add_argument("--level_min_confidence", type=float, default=0.25)
     ap.add_argument("--level_preview_fov", type=float, default=90.0)
     ap.add_argument("--level_preview_w", type=int, default=768)
@@ -203,7 +202,7 @@ def main() -> None:
             crop_interpolation=args.crop_interpolation,
             overwrite=args.overwrite,
             log_path=log_path,
-            level_horizon=args.level_horizon,
+            level_method=args.level_method,
             level_min_confidence=args.level_min_confidence,
             level_preview_fov=args.level_preview_fov,
             level_preview_w=args.level_preview_w,
@@ -253,7 +252,7 @@ def main() -> None:
                 crop_interpolation=args.crop_interpolation,
                 overwrite=args.overwrite,
                 log_path=log_path,
-                level_horizon=args.level_horizon,
+                level_method=args.level_method,
                 level_min_confidence=args.level_min_confidence,
                 level_preview_fov=args.level_preview_fov,
                 level_preview_w=args.level_preview_w,

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
+import numpy as np
 
 from .config import AgentConfig
 from .crop import build_crop_name as _build_crop_name, render_detection_crop
@@ -22,7 +23,11 @@ from .io_utils import (
     save_json,
     unique_path,
 )
-from .leveling import estimate_pano_level_correction, make_level_rotation
+from .leveling import (
+    estimate_pano_level_correction,
+    estimate_pano_spherical_ransac_correction,
+    make_level_rotation,
+)
 from .refine_policy import need_center_by_edge, plan_refine_view
 from .spherical_camera import clamp_pitch_deg, wrap_yaw_deg
 from .visualize import draw_annot, draw_refine_compare, draw_status
@@ -52,32 +57,52 @@ def _disabled_level_meta(reason: str, **extra: Any) -> Dict[str, Any]:
 
 def _estimate_leveling_for_pano(
     pano_bgr: Any,
+    yaw_center: float,
+    level_method: str,
     level_horizon: bool,
     level_min_confidence: float,
     level_preview_fov: float,
     level_preview_w: int,
     level_preview_h: int,
 ) -> Tuple[Dict[str, Any], Optional[Any]]:
-    if not bool(level_horizon):
+    method = str(level_method or "none").strip().lower()
+    if method == "none":
         return _disabled_level_meta("disabled"), None
 
     try:
-        level_meta = estimate_pano_level_correction(
-            pano_bgr,
-            preview_fov=float(level_preview_fov),
-            preview_w=int(level_preview_w),
-            preview_h=int(level_preview_h),
-        )
+        if method == "spherical_ransac":
+            level_meta = estimate_pano_spherical_ransac_correction(
+                pano_bgr,
+                yaw_center=float(yaw_center),
+                preview_fov=float(level_preview_fov),
+                preview_w=int(level_preview_w),
+                preview_h=int(level_preview_h),
+            )
+        elif method == "hough_lines":
+            level_meta = estimate_pano_level_correction(
+                pano_bgr,
+                preview_fov=float(level_preview_fov),
+                preview_w=int(level_preview_w),
+                preview_h=int(level_preview_h),
+            )
+        else:
+            return _disabled_level_meta("unsupported_level_method", level_method=method), None
     except Exception as exc:
-        return _disabled_level_meta("estimate_failed", error=str(exc)), None
+        return _disabled_level_meta("estimate_failed", error=str(exc), level_method=method), None
 
     level_meta = dict(level_meta)
+    level_meta["level_method"] = method
     level_meta["min_confidence"] = float(level_min_confidence)
     level_confidence = float(level_meta.get("confidence", 0.0) or 0.0)
     applied = bool(level_meta.get("enabled", False)) and level_confidence >= float(level_min_confidence)
     level_meta["applied"] = bool(applied)
     if not applied:
+        if method == "spherical_ransac":
+            level_meta["R_level"] = None
         return level_meta, None
+    if method == "spherical_ransac":
+        R_level = level_meta.get("R_level")
+        return level_meta, None if R_level is None else np.asarray(R_level, dtype=np.float64)
     return level_meta, make_level_rotation(float(level_meta.get("roll_deg", 0.0) or 0.0))
 
 
@@ -95,6 +120,7 @@ def make_crops_stage(
     crop_interpolation: str,
     overwrite: bool,
     log_path: Path,
+    level_method: str = "none",
     level_horizon: bool = True,
     level_min_confidence: float = 0.25,
     level_preview_fov: float = 90.0,
@@ -130,6 +156,8 @@ def make_crops_stage(
             continue
         level_meta, R_level = _estimate_leveling_for_pano(
             pano_bgr=pano,
+            yaw_center=float(yaw_map.get(fid, 0.0)),
+            level_method=str(level_method),
             level_horizon=level_horizon,
             level_min_confidence=level_min_confidence,
             level_preview_fov=level_preview_fov,
@@ -311,6 +339,7 @@ def detect_from_panos_stage(
     crop_interpolation: str,
     overwrite: bool,
     log_path: Path,
+    level_method: str = "none",
     level_horizon: bool = True,
     level_min_confidence: float = 0.25,
     level_preview_fov: float = 90.0,
@@ -344,6 +373,7 @@ def detect_from_panos_stage(
         crop_strategy=crop_strategy,
         crop_supersample=crop_supersample,
         crop_interpolation=crop_interpolation,
+        level_method=level_method,
         level_horizon=level_horizon,
         level_min_confidence=level_min_confidence,
         level_preview_fov=level_preview_fov,
@@ -368,6 +398,8 @@ def detect_from_panos_stage(
             continue
         level_meta, R_level = _estimate_leveling_for_pano(
             pano_bgr=pano,
+            yaw_center=float(yaw_map.get(fid, 0.0)),
+            level_method=str(level_method),
             level_horizon=cfg.level_horizon,
             level_min_confidence=cfg.level_min_confidence,
             level_preview_fov=cfg.level_preview_fov,
