@@ -214,6 +214,29 @@ python experiments/leveling/run_spherical_outlier_ablation_selected20.py
 
 batch 実行後は `upright_ablation_index.json` を見れば、method 別の `applied_count`, `reject_count`, `mean/median residual`, `angle_to_world_up_deg` 平均を確認できます。
 
+## 開発ルール：大きな変更前の GitHub 退避
+
+本プロジェクトでは、agent の挙動に影響する大きな変更を行う前に、必ず現在の状態を GitHub に push する。
+
+特に以下の変更を行う場合は、作業前に commit / push すること。
+
+- crop 生成方法の変更
+- yaw / pitch / roll / R_level など座標変換の変更
+- 再探索処理の変更
+- bbox 中心から ray / 方位角を計算する処理の変更
+- GIS 出力の変更
+- config のデフォルト値変更
+- pipeline 全体に影響する処理の追加
+
+作業前の基本手順:
+
+```bash
+git status
+git add .
+git commit -m "Save current state before major change"
+git push
+```
+
 ## 削除方法
 
 ```bash
