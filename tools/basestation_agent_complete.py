@@ -51,6 +51,12 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--hfov", type=float, default=105.0)
     ap.add_argument("--crop_width", type=int, default=1280)
     ap.add_argument("--crop_height", type=int, default=1280)
+    ap.add_argument("--level_horizon", dest="level_horizon", action="store_true", default=True)
+    ap.add_argument("--no_level_horizon", dest="level_horizon", action="store_false")
+    ap.add_argument("--level_min_confidence", type=float, default=0.25)
+    ap.add_argument("--level_preview_fov", type=float, default=90.0)
+    ap.add_argument("--level_preview_w", type=int, default=768)
+    ap.add_argument("--level_preview_h", type=int, default=768)
 
     ap.add_argument("--conf", type=float, default=0.20)
     ap.add_argument("--imgsz", type=int, default=1280)
@@ -197,6 +203,11 @@ def main() -> None:
             crop_interpolation=args.crop_interpolation,
             overwrite=args.overwrite,
             log_path=log_path,
+            level_horizon=args.level_horizon,
+            level_min_confidence=args.level_min_confidence,
+            level_preview_fov=args.level_preview_fov,
+            level_preview_w=args.level_preview_w,
+            level_preview_h=args.level_preview_h,
         )
 
     if do_detect:
@@ -242,6 +253,11 @@ def main() -> None:
                 crop_interpolation=args.crop_interpolation,
                 overwrite=args.overwrite,
                 log_path=log_path,
+                level_horizon=args.level_horizon,
+                level_min_confidence=args.level_min_confidence,
+                level_preview_fov=args.level_preview_fov,
+                level_preview_w=args.level_preview_w,
+                level_preview_h=args.level_preview_h,
             )
 
     detection_rows = read_jsonl(detections_jsonl) if detections_jsonl.exists() else []

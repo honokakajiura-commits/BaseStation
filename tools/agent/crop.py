@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -97,6 +97,9 @@ def render_detection_crop(
     crop_strategy: str,
     supersample: float,
     interpolation: str,
+    R_level: Optional[np.ndarray] = None,
+    roll_deg: float = 0.0,
+    level_meta: Optional[dict] = None,
 ) -> Tuple[np.ndarray, dict]:
     strategy = str(crop_strategy or "").strip().lower()
     if strategy not in {"legacy", "ui_like"}:
@@ -111,11 +114,11 @@ def render_detection_crop(
         pano_bgr,
         yaw=float(yaw_deg),
         pitch=float(pitch_deg),
-        roll=0.0,
+        roll=float(roll_deg),
         fov_x=float(fov_deg),
         out_w=int(render_w),
         out_h=int(render_h),
-        R_level=None,
+        R_level=R_level,
         interpolation=remap_interp,
     )
 
@@ -133,5 +136,12 @@ def render_detection_crop(
         "fov_deg": float(fov_deg),
         "yaw_deg": float(yaw_deg),
         "pitch_deg": float(pitch_deg),
+        "roll_deg": float(roll_deg),
+        "leveling_enabled": bool(R_level is not None),
+        "level_roll_deg": float((level_meta or {}).get("roll_deg", 0.0) or 0.0),
+        "level_confidence": float((level_meta or {}).get("confidence", 0.0) or 0.0),
+        "level_sample_count": int((level_meta or {}).get("sample_count", 0) or 0),
+        "level_used_sample_count": int((level_meta or {}).get("used_sample_count", 0) or 0),
+        "R_level_applied": bool(R_level is not None),
     }
     return crop, meta

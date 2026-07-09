@@ -17,6 +17,11 @@ class AgentConfig:
     crop_strategy: str = "ui_like"
     crop_supersample: float = 1.25
     crop_interpolation: str = "cubic"
+    level_horizon: bool = True
+    level_min_confidence: float = 0.25
+    level_preview_fov: float = 90.0
+    level_preview_w: int = 768
+    level_preview_h: int = 768
 
     zoom_min_fov: float = 50.0
     high_conf: float = 0.60
@@ -33,4 +38,3 @@ class AgentConfig:
 
     max_refine: int = 2
     yaw_side_deg: float = 90.0
-

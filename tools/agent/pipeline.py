@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 
@@ -22,6 +22,7 @@ from .io_utils import (
     save_json,
     unique_path,
 )
+from .leveling import estimate_pano_level_correction, make_level_rotation
 from .refine_policy import need_center_by_edge, plan_refine_view
 from .spherical_camera import clamp_pitch_deg, wrap_yaw_deg
 from .visualize import draw_annot, draw_refine_compare, draw_status
@@ -31,6 +32,53 @@ from .yaw import ensure_yaw_map
 def plan_detection_refine(*args, **kwargs):
     """Compatibility shim for older callers."""
     return plan_refine_view(*args, **kwargs)
+
+
+def _disabled_level_meta(reason: str, **extra: Any) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {
+        "enabled": False,
+        "roll_deg": 0.0,
+        "confidence": 0.0,
+        "sample_count": 0,
+        "used_sample_count": 0,
+        "samples": [],
+        "method": "hough_lines",
+        "reason": reason,
+        "applied": False,
+    }
+    meta.update(extra)
+    return meta
+
+
+def _estimate_leveling_for_pano(
+    pano_bgr: Any,
+    level_horizon: bool,
+    level_min_confidence: float,
+    level_preview_fov: float,
+    level_preview_w: int,
+    level_preview_h: int,
+) -> Tuple[Dict[str, Any], Optional[Any]]:
+    if not bool(level_horizon):
+        return _disabled_level_meta("disabled"), None
+
+    try:
+        level_meta = estimate_pano_level_correction(
+            pano_bgr,
+            preview_fov=float(level_preview_fov),
+            preview_w=int(level_preview_w),
+            preview_h=int(level_preview_h),
+        )
+    except Exception as exc:
+        return _disabled_level_meta("estimate_failed", error=str(exc)), None
+
+    level_meta = dict(level_meta)
+    level_meta["min_confidence"] = float(level_min_confidence)
+    level_confidence = float(level_meta.get("confidence", 0.0) or 0.0)
+    applied = bool(level_meta.get("enabled", False)) and level_confidence >= float(level_min_confidence)
+    level_meta["applied"] = bool(applied)
+    if not applied:
+        return level_meta, None
+    return level_meta, make_level_rotation(float(level_meta.get("roll_deg", 0.0) or 0.0))
 
 
 def make_crops_stage(
@@ -47,6 +95,11 @@ def make_crops_stage(
     crop_interpolation: str,
     overwrite: bool,
     log_path: Path,
+    level_horizon: bool = True,
+    level_min_confidence: float = 0.25,
+    level_preview_fov: float = 90.0,
+    level_preview_w: int = 768,
+    level_preview_h: int = 768,
 ) -> Dict[str, Any]:
     ensure_dir(crops_dir)
     rows = load_ordered_index(ordered_index)
@@ -75,6 +128,14 @@ def make_crops_stage(
         pano = cv2.imread(str(pano_path))
         if pano is None:
             continue
+        level_meta, R_level = _estimate_leveling_for_pano(
+            pano_bgr=pano,
+            level_horizon=level_horizon,
+            level_min_confidence=level_min_confidence,
+            level_preview_fov=level_preview_fov,
+            level_preview_w=level_preview_w,
+            level_preview_h=level_preview_h,
+        )
         yaw_center = float(yaw_map.get(fid, 0.0))
         for view_name, yaw_off in [("front", 0.0), ("left", -90.0), ("right", 90.0)]:
             yaw = wrap_yaw_deg(yaw_center + yaw_off)
@@ -102,6 +163,9 @@ def make_crops_stage(
                 crop_strategy=crop_strategy,
                 supersample=crop_supersample,
                 interpolation=crop_interpolation,
+                R_level=R_level,
+                roll_deg=0.0,
+                level_meta=level_meta,
             )
             cv2.imwrite(str(crop_path), crop)
             append_jsonl(
@@ -123,7 +187,15 @@ def make_crops_stage(
                 status="ok",
                 input_file=str(pano_path),
                 output_file=str(crop_path),
-                params={"fid": fid, "view": view_name, "hfov": hfov, "pitch_cli": pitch_cli},
+                params={
+                    "fid": fid,
+                    "view": view_name,
+                    "hfov": hfov,
+                    "pitch_cli": pitch_cli,
+                    "level_horizon": bool(level_horizon),
+                    "level_min_confidence": float(level_min_confidence),
+                },
+                level_meta=level_meta,
                 crop_meta=crop_meta,
             )
             made += 1
@@ -142,6 +214,11 @@ def make_crops_stage(
             "hfov": hfov,
             "crop_width": crop_width,
             "crop_height": crop_height,
+            "level_horizon": bool(level_horizon),
+            "level_min_confidence": float(level_min_confidence),
+            "level_preview_fov": float(level_preview_fov),
+            "level_preview_w": int(level_preview_w),
+            "level_preview_h": int(level_preview_h),
         },
         made=made,
         skipped=skipped,
@@ -234,6 +311,11 @@ def detect_from_panos_stage(
     crop_interpolation: str,
     overwrite: bool,
     log_path: Path,
+    level_horizon: bool = True,
+    level_min_confidence: float = 0.25,
+    level_preview_fov: float = 90.0,
+    level_preview_w: int = 768,
+    level_preview_h: int = 768,
 ) -> Dict[str, Any]:
     ensure_dir(crops_dir)
     ensure_dir(annotated_dir)
@@ -262,6 +344,11 @@ def detect_from_panos_stage(
         crop_strategy=crop_strategy,
         crop_supersample=crop_supersample,
         crop_interpolation=crop_interpolation,
+        level_horizon=level_horizon,
+        level_min_confidence=level_min_confidence,
+        level_preview_fov=level_preview_fov,
+        level_preview_w=level_preview_w,
+        level_preview_h=level_preview_h,
     )
     yolo = YoloRunner(weights, conf=conf, imgsz=imgsz, device=device)
     total_panos = 0
@@ -279,6 +366,14 @@ def detect_from_panos_stage(
         if pano is None:
             append_stage_log(log_path, "detect_pano", "fail", input_file=str(pano_path), error="imread_failed", fid=fid)
             continue
+        level_meta, R_level = _estimate_leveling_for_pano(
+            pano_bgr=pano,
+            level_horizon=cfg.level_horizon,
+            level_min_confidence=cfg.level_min_confidence,
+            level_preview_fov=cfg.level_preview_fov,
+            level_preview_w=cfg.level_preview_w,
+            level_preview_h=cfg.level_preview_h,
+        )
 
         total_panos += 1
         yaw_center = float(yaw_map.get(fid, 0.0))
@@ -310,7 +405,17 @@ def detect_from_panos_stage(
                 crop_meta: Dict[str, Any]
                 if crop_path.exists() and not overwrite:
                     crop = cv2.imread(str(crop_path))
-                    crop_meta = {"source": "existing_crop", "strategy": crop_strategy}
+                    crop_meta = {
+                        "source": "existing_crop",
+                        "strategy": crop_strategy,
+                        "roll_deg": 0.0,
+                        "leveling_enabled": False,
+                        "level_roll_deg": float(level_meta.get("roll_deg", 0.0) or 0.0),
+                        "level_confidence": float(level_meta.get("confidence", 0.0) or 0.0),
+                        "level_sample_count": int(level_meta.get("sample_count", 0) or 0),
+                        "level_used_sample_count": int(level_meta.get("used_sample_count", 0) or 0),
+                        "R_level_applied": False,
+                    }
                     if crop is None:
                         crop, crop_meta = render_detection_crop(
                             pano_bgr=pano,
@@ -322,6 +427,9 @@ def detect_from_panos_stage(
                             crop_strategy=cfg.crop_strategy,
                             supersample=cfg.crop_supersample,
                             interpolation=cfg.crop_interpolation,
+                            R_level=R_level,
+                            roll_deg=0.0,
+                            level_meta=level_meta,
                         )
                         cv2.imwrite(str(crop_path), crop)
                 else:
@@ -335,6 +443,9 @@ def detect_from_panos_stage(
                         crop_strategy=cfg.crop_strategy,
                         supersample=cfg.crop_supersample,
                         interpolation=cfg.crop_interpolation,
+                        R_level=R_level,
+                        roll_deg=0.0,
+                        level_meta=level_meta,
                     )
                     cv2.imwrite(str(crop_path), crop)
                 total_crops += 1
@@ -441,7 +552,7 @@ def detect_from_panos_stage(
                     image_h=cfg.det_h,
                     min_fov=cfg.zoom_min_fov,
                     margin_deg=cfg.bbox_margin_deg,
-                    R_level=None,
+                    R_level=R_level,
                     recenter_pitch=cfg.recenter_pitch,
                     max_zoom_ratio=cfg.refine_zoom_ratio_small,
                 )
@@ -459,7 +570,14 @@ def detect_from_panos_stage(
                     step="refine_plan",
                     status="ok",
                     input_file=str(crop_path),
-                    params={"fid": fid, "view": view_name, "s": step},
+                    params={
+                        "fid": fid,
+                        "view": view_name,
+                        "s": step,
+                        "level_horizon": bool(cfg.level_horizon),
+                        "level_min_confidence": float(cfg.level_min_confidence),
+                    },
+                    level_meta=level_meta,
                     refine_action=refine_action,
                     previous_yaw=float(cur_yaw),
                     previous_pitch=float(cur_pitch),
@@ -507,7 +625,8 @@ def detect_from_panos_stage(
             step="detect_pano_done",
             status="ok",
             input_file=str(pano_path),
-            params={"fid": fid},
+            params={"fid": fid, "level_horizon": bool(cfg.level_horizon)},
+            level_meta=level_meta,
             confirmed=pano_confirmed,
             candidate=pano_candidate,
         )
@@ -528,6 +647,11 @@ def detect_from_panos_stage(
             "crop_strategy": crop_strategy,
             "crop_supersample": crop_supersample,
             "crop_interpolation": crop_interpolation,
+            "level_horizon": bool(cfg.level_horizon),
+            "level_min_confidence": float(cfg.level_min_confidence),
+            "level_preview_fov": float(cfg.level_preview_fov),
+            "level_preview_w": int(cfg.level_preview_w),
+            "level_preview_h": int(cfg.level_preview_h),
             "weights": weights,
             "conf": float(conf),
             "imgsz": int(imgsz),
@@ -551,7 +675,14 @@ def detect_from_panos_stage(
         status="ok",
         input_file=str(ordered_index),
         output_file=str(detections_jsonl),
-        params={"weights": weights, "conf": conf, "imgsz": imgsz, "device": device},
+        params={
+            "weights": weights,
+            "conf": conf,
+            "imgsz": imgsz,
+            "device": device,
+            "level_horizon": bool(cfg.level_horizon),
+            "level_min_confidence": float(cfg.level_min_confidence),
+        },
         processed_panos=total_panos,
         confirmed=confirmed,
         candidates=candidates,
