@@ -18,11 +18,18 @@ class AgentConfig:
     crop_supersample: float = 1.25
     crop_interpolation: str = "cubic"
     level_method: str = "none"
+    level_debug: bool = False
+    level_preview_pitch: float = 0.0
+    level_preview_fov: float = 90.0
+    level_preview_w: int = 1024
+    level_preview_h: int = 768
+    level_ransac_iters: int = 1000
+    level_residual_thresh_deg: float = 3.0
+    level_min_inliers: int = 8
+    level_min_total_lines: int = 20
+    level_max_apply_deg: float = 5.0
     level_horizon: bool = True
     level_min_confidence: float = 0.25
-    level_preview_fov: float = 90.0
-    level_preview_w: int = 768
-    level_preview_h: int = 768
 
     zoom_min_fov: float = 50.0
     high_conf: float = 0.60

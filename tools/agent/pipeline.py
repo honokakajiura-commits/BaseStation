@@ -23,11 +23,8 @@ from .io_utils import (
     save_json,
     unique_path,
 )
-from .leveling import (
-    estimate_pano_level_correction,
-    estimate_pano_spherical_ransac_correction,
-    make_level_rotation,
-)
+from .leveling import make_level_rotation
+from .leveling_spherical import LevelEstimate, estimate_spherical_ransac_level
 from .refine_policy import need_center_by_edge, plan_refine_view
 from .spherical_camera import clamp_pitch_deg, wrap_yaw_deg
 from .visualize import draw_annot, draw_refine_compare, draw_status
@@ -39,6 +36,9 @@ def plan_detection_refine(*args, **kwargs):
     return plan_refine_view(*args, **kwargs)
 
 
+_LEVELING_CACHE: Dict[Tuple[str, str], Tuple[Dict[str, Any], Optional[np.ndarray]]] = {}
+
+
 def _disabled_level_meta(reason: str, **extra: Any) -> Dict[str, Any]:
     meta: Dict[str, Any] = {
         "enabled": False,
@@ -47,7 +47,7 @@ def _disabled_level_meta(reason: str, **extra: Any) -> Dict[str, Any]:
         "sample_count": 0,
         "used_sample_count": 0,
         "samples": [],
-        "method": "hough_lines",
+        "method": "none",
         "reason": reason,
         "applied": False,
     }
@@ -55,55 +55,162 @@ def _disabled_level_meta(reason: str, **extra: Any) -> Dict[str, Any]:
     return meta
 
 
+def _effective_crops_dir(crops_dir: Path, level_method: str) -> Path:
+    method = str(level_method or "none").strip().lower()
+    if method == "none":
+        return crops_dir
+    return crops_dir.parent / f"{crops_dir.name}_{method}"
+
+
+def _augment_crop_meta(crop_meta: Dict[str, Any], level_meta: Dict[str, Any], R_level: Optional[np.ndarray], level_method: str) -> None:
+    crop_meta.update(
+        {
+            "level_method": str(level_meta.get("level_method", level_method)),
+            "level_applied": bool(level_meta.get("applied", False)),
+            "level_reject_reason": level_meta.get("reject_reason"),
+            "level_angle_to_world_up_deg": level_meta.get("angle_to_world_up_deg"),
+            "level_total_line_count": int(level_meta.get("total_line_count", 0) or 0),
+            "level_inlier_count": int(level_meta.get("inlier_count", 0) or 0),
+            "level_inlier_ratio": float(level_meta.get("inlier_ratio", 0.0) or 0.0),
+            "level_mean_residual_deg": level_meta.get("mean_residual_deg"),
+            "level_median_residual_deg": level_meta.get("median_residual_deg"),
+            "level_v_up": level_meta.get("v_up"),
+            "R_level_applied": bool(R_level is not None),
+        }
+    )
+
+
 def _estimate_leveling_for_pano(
     pano_bgr: Any,
+    fid: str,
     yaw_center: float,
     level_method: str,
-    level_horizon: bool,
     level_min_confidence: float,
+    level_preview_pitch: float,
     level_preview_fov: float,
     level_preview_w: int,
     level_preview_h: int,
+    level_ransac_iters: int,
+    level_residual_thresh_deg: float,
+    level_min_inliers: int,
+    level_min_total_lines: int,
+    level_max_apply_deg: float,
+    level_debug: bool,
+    debug_dir: Optional[Path],
+    leveling_jsonl: Optional[Path],
 ) -> Tuple[Dict[str, Any], Optional[Any]]:
     method = str(level_method or "none").strip().lower()
     if method == "none":
-        return _disabled_level_meta("disabled"), None
+        meta = _disabled_level_meta("disabled", level_method="none")
+        return meta, None
+
+    if method != "spherical_ransac":
+        raise ValueError(f"unsupported level_method: {method}")
+
+    cache_key = (str(fid), method)
+    cached = _LEVELING_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     try:
-        if method == "spherical_ransac":
-            level_meta = estimate_pano_spherical_ransac_correction(
-                pano_bgr,
-                yaw_center=float(yaw_center),
-                preview_fov=float(level_preview_fov),
-                preview_w=int(level_preview_w),
-                preview_h=int(level_preview_h),
-            )
-        elif method == "hough_lines":
-            level_meta = estimate_pano_level_correction(
-                pano_bgr,
-                preview_fov=float(level_preview_fov),
-                preview_w=int(level_preview_w),
-                preview_h=int(level_preview_h),
-            )
-        else:
-            return _disabled_level_meta("unsupported_level_method", level_method=method), None
+        estimate = estimate_spherical_ransac_level(
+            pano_bgr=pano_bgr,
+            yaw_center=float(yaw_center),
+            preview_yaw_offsets=(-135, -90, -45, 0, 45, 90, 135),
+            preview_pitch=float(level_preview_pitch),
+            preview_fov=float(level_preview_fov),
+            preview_w=int(level_preview_w),
+            preview_h=int(level_preview_h),
+            ransac_iters=int(level_ransac_iters),
+            residual_thresh_deg=float(level_residual_thresh_deg),
+            min_inliers=int(level_min_inliers),
+            min_total_lines=int(level_min_total_lines),
+            max_apply_deg=float(level_max_apply_deg),
+            debug=bool(level_debug),
+            debug_dir=debug_dir,
+        )
     except Exception as exc:
-        return _disabled_level_meta("estimate_failed", error=str(exc), level_method=method), None
+        meta = _disabled_level_meta("estimate_failed", error=str(exc), level_method=method)
+        _LEVELING_CACHE[cache_key] = (meta, None)
+        if leveling_jsonl is not None:
+            append_jsonl(
+                leveling_jsonl,
+                {
+                    "fid": fid,
+                    "method": method,
+                    "applied": False,
+                    "reject_reason": "estimate_failed",
+                    "yaw_center": float(yaw_center),
+                    "angle_to_world_up_deg": None,
+                    "total_line_count": 0,
+                    "inlier_count": 0,
+                    "inlier_ratio": 0.0,
+                    "mean_residual_deg": None,
+                    "median_residual_deg": None,
+                    "R_level": None,
+                },
+            )
+        return meta, None
 
-    level_meta = dict(level_meta)
-    level_meta["level_method"] = method
-    level_meta["min_confidence"] = float(level_min_confidence)
-    level_confidence = float(level_meta.get("confidence", 0.0) or 0.0)
-    applied = bool(level_meta.get("enabled", False)) and level_confidence >= float(level_min_confidence)
-    level_meta["applied"] = bool(applied)
-    if not applied:
-        if method == "spherical_ransac":
-            level_meta["R_level"] = None
-        return level_meta, None
-    if method == "spherical_ransac":
-        R_level = level_meta.get("R_level")
-        return level_meta, None if R_level is None else np.asarray(R_level, dtype=np.float64)
-    return level_meta, make_level_rotation(float(level_meta.get("roll_deg", 0.0) or 0.0))
+    level_meta: Dict[str, Any] = {
+        "enabled": bool(estimate.applied),
+        "method": estimate.method,
+        "applied": bool(estimate.applied),
+        "reason": estimate.reject_reason,
+        "reject_reason": estimate.reject_reason,
+        "confidence": float(estimate.inlier_ratio),
+        "sample_count": int(estimate.debug.get("preview_count", 0) or 0),
+        "used_sample_count": int(estimate.inlier_count),
+        "v_up": estimate.v_up,
+        "angle_to_world_up_deg": estimate.angle_to_world_up_deg,
+        "total_line_count": int(estimate.total_line_count),
+        "inlier_count": int(estimate.inlier_count),
+        "inlier_ratio": float(estimate.inlier_ratio),
+        "mean_residual_deg": estimate.mean_residual_deg,
+        "median_residual_deg": estimate.median_residual_deg,
+        "residual_thresh_deg": float(estimate.residual_thresh_deg),
+        "ransac_iters": int(estimate.ransac_iters),
+        "level_method": method,
+        "level_debug": bool(level_debug),
+        "level_preview_pitch": float(level_preview_pitch),
+        "level_preview_fov": float(level_preview_fov),
+        "level_preview_w": int(level_preview_w),
+        "level_preview_h": int(level_preview_h),
+        "level_ransac_iters": int(level_ransac_iters),
+        "level_residual_thresh_deg": float(level_residual_thresh_deg),
+        "level_min_inliers": int(level_min_inliers),
+        "level_min_total_lines": int(level_min_total_lines),
+        "level_max_apply_deg": float(level_max_apply_deg),
+        "debug": estimate.debug,
+    }
+    R_level = None
+    if estimate.applied and estimate.R_level is not None:
+        R_level = np.asarray(estimate.R_level, dtype=np.float64)
+        level_meta["R_level"] = R_level.tolist()
+    else:
+        level_meta["R_level"] = None
+
+    result = (level_meta, R_level)
+    _LEVELING_CACHE[cache_key] = result
+    if leveling_jsonl is not None:
+        append_jsonl(
+            leveling_jsonl,
+            {
+                "fid": fid,
+                "method": method,
+                "applied": bool(estimate.applied),
+                "reject_reason": estimate.reject_reason,
+                "yaw_center": float(yaw_center),
+                "angle_to_world_up_deg": estimate.angle_to_world_up_deg,
+                "total_line_count": int(estimate.total_line_count),
+                "inlier_count": int(estimate.inlier_count),
+                "inlier_ratio": float(estimate.inlier_ratio),
+                "mean_residual_deg": estimate.mean_residual_deg,
+                "median_residual_deg": estimate.median_residual_deg,
+                "R_level": None if R_level is None else R_level.tolist(),
+            },
+        )
+    return result
 
 
 def make_crops_stage(
@@ -121,13 +228,20 @@ def make_crops_stage(
     overwrite: bool,
     log_path: Path,
     level_method: str = "none",
-    level_horizon: bool = True,
-    level_min_confidence: float = 0.25,
+    level_debug: bool = False,
+    level_preview_pitch: float = 0.0,
     level_preview_fov: float = 90.0,
-    level_preview_w: int = 768,
+    level_preview_w: int = 1024,
     level_preview_h: int = 768,
+    level_ransac_iters: int = 1000,
+    level_residual_thresh_deg: float = 3.0,
+    level_min_inliers: int = 8,
+    level_min_total_lines: int = 20,
+    level_max_apply_deg: float = 5.0,
+    level_min_confidence: float = 0.25,
 ) -> Dict[str, Any]:
-    ensure_dir(crops_dir)
+    effective_crops_dir = _effective_crops_dir(crops_dir, level_method)
+    ensure_dir(effective_crops_dir)
     rows = load_ordered_index(ordered_index)
     # Internal pitch is positive upward. Keep the CLI conversion in one place.
     pitch_deg = float(pitch_cli)
@@ -142,9 +256,11 @@ def make_crops_stage(
         overwrite=overwrite,
         log_path=log_path,
     )
+    leveling_jsonl = log_path.parent / "leveling_spherical.jsonl"
+    level_debug_dir = log_path.parent / "leveling_spherical_debug"
     made = 0
     skipped = 0
-    crop_manifest_path = crops_dir.parent / "crops_manifest.jsonl"
+    crop_manifest_path = effective_crops_dir.parent / f"{effective_crops_dir.name}_manifest.jsonl"
 
     for i, row in enumerate(rows, start=1):
         fid = row["fid"]
@@ -156,13 +272,22 @@ def make_crops_stage(
             continue
         level_meta, R_level = _estimate_leveling_for_pano(
             pano_bgr=pano,
+            fid=str(fid),
             yaw_center=float(yaw_map.get(fid, 0.0)),
             level_method=str(level_method),
-            level_horizon=level_horizon,
             level_min_confidence=level_min_confidence,
+            level_preview_pitch=float(level_preview_pitch),
             level_preview_fov=level_preview_fov,
             level_preview_w=level_preview_w,
             level_preview_h=level_preview_h,
+            level_ransac_iters=level_ransac_iters,
+            level_residual_thresh_deg=level_residual_thresh_deg,
+            level_min_inliers=level_min_inliers,
+            level_min_total_lines=level_min_total_lines,
+            level_max_apply_deg=level_max_apply_deg,
+            level_debug=level_debug,
+            debug_dir=level_debug_dir if level_debug else None,
+            leveling_jsonl=leveling_jsonl,
         )
         yaw_center = float(yaw_map.get(fid, 0.0))
         for view_name, yaw_off in [("front", 0.0), ("left", -90.0), ("right", 90.0)]:
@@ -177,7 +302,7 @@ def make_crops_stage(
                 last_yaw_delta=0.0,
                 last_zoom=False,
             )
-            crop_path = crops_dir / crop_name
+            crop_path = effective_crops_dir / crop_name
             if crop_path.exists() and not overwrite:
                 skipped += 1
                 continue
@@ -195,6 +320,7 @@ def make_crops_stage(
                 roll_deg=0.0,
                 level_meta=level_meta,
             )
+            _augment_crop_meta(crop_meta, level_meta, R_level, level_method)
             cv2.imwrite(str(crop_path), crop)
             append_jsonl(
                 crop_manifest_path,
@@ -220,7 +346,7 @@ def make_crops_stage(
                     "view": view_name,
                     "hfov": hfov,
                     "pitch_cli": pitch_cli,
-                    "level_horizon": bool(level_horizon),
+                    "level_method": str(level_method),
                     "level_min_confidence": float(level_min_confidence),
                 },
                 level_meta=level_meta,
@@ -233,7 +359,7 @@ def make_crops_stage(
         step="make_crops",
         status="ok",
         input_file=str(ordered_index),
-        output_file=str(crops_dir),
+        output_file=str(effective_crops_dir),
         params={
             "crop_strategy": crop_strategy,
             "crop_supersample": crop_supersample,
@@ -242,7 +368,7 @@ def make_crops_stage(
             "hfov": hfov,
             "crop_width": crop_width,
             "crop_height": crop_height,
-            "level_horizon": bool(level_horizon),
+            "level_method": str(level_method),
             "level_min_confidence": float(level_min_confidence),
             "level_preview_fov": float(level_preview_fov),
             "level_preview_w": int(level_preview_w),
@@ -251,7 +377,7 @@ def make_crops_stage(
         made=made,
         skipped=skipped,
     )
-    return {"made": made, "skipped": skipped, "crops_dir": str(crops_dir)}
+    return {"made": made, "skipped": skipped, "crops_dir": str(effective_crops_dir)}
 
 
 def detect_existing_crops_stage(
@@ -340,13 +466,20 @@ def detect_from_panos_stage(
     overwrite: bool,
     log_path: Path,
     level_method: str = "none",
-    level_horizon: bool = True,
-    level_min_confidence: float = 0.25,
+    level_debug: bool = False,
+    level_preview_pitch: float = 0.0,
     level_preview_fov: float = 90.0,
-    level_preview_w: int = 768,
+    level_preview_w: int = 1024,
     level_preview_h: int = 768,
+    level_ransac_iters: int = 1000,
+    level_residual_thresh_deg: float = 3.0,
+    level_min_inliers: int = 8,
+    level_min_total_lines: int = 20,
+    level_max_apply_deg: float = 5.0,
+    level_min_confidence: float = 0.25,
 ) -> Dict[str, Any]:
-    ensure_dir(crops_dir)
+    effective_crops_dir = _effective_crops_dir(crops_dir, level_method)
+    ensure_dir(effective_crops_dir)
     ensure_dir(annotated_dir)
     ensure_dir(compare_dir)
 
@@ -374,11 +507,17 @@ def detect_from_panos_stage(
         crop_supersample=crop_supersample,
         crop_interpolation=crop_interpolation,
         level_method=level_method,
-        level_horizon=level_horizon,
-        level_min_confidence=level_min_confidence,
+        level_debug=level_debug,
+        level_preview_pitch=level_preview_pitch,
         level_preview_fov=level_preview_fov,
         level_preview_w=level_preview_w,
         level_preview_h=level_preview_h,
+        level_ransac_iters=level_ransac_iters,
+        level_residual_thresh_deg=level_residual_thresh_deg,
+        level_min_inliers=level_min_inliers,
+        level_min_total_lines=level_min_total_lines,
+        level_max_apply_deg=level_max_apply_deg,
+        level_min_confidence=level_min_confidence,
     )
     yolo = YoloRunner(weights, conf=conf, imgsz=imgsz, device=device)
     total_panos = 0
@@ -398,13 +537,22 @@ def detect_from_panos_stage(
             continue
         level_meta, R_level = _estimate_leveling_for_pano(
             pano_bgr=pano,
+            fid=str(fid),
             yaw_center=float(yaw_map.get(fid, 0.0)),
             level_method=str(level_method),
-            level_horizon=cfg.level_horizon,
             level_min_confidence=cfg.level_min_confidence,
+            level_preview_pitch=cfg.level_preview_pitch,
             level_preview_fov=cfg.level_preview_fov,
             level_preview_w=cfg.level_preview_w,
             level_preview_h=cfg.level_preview_h,
+            level_ransac_iters=cfg.level_ransac_iters,
+            level_residual_thresh_deg=cfg.level_residual_thresh_deg,
+            level_min_inliers=cfg.level_min_inliers,
+            level_min_total_lines=cfg.level_min_total_lines,
+            level_max_apply_deg=cfg.level_max_apply_deg,
+            level_debug=cfg.level_debug,
+            debug_dir=(log_path.parent / "leveling_spherical_debug") if cfg.level_debug else None,
+            leveling_jsonl=log_path.parent / "leveling_spherical.jsonl",
         )
 
         total_panos += 1
@@ -433,7 +581,7 @@ def detect_from_panos_stage(
                     last_yaw_delta=last_yaw_delta,
                     last_zoom=last_zoom,
                 )
-                crop_path = crops_dir / crop_name
+                crop_path = effective_crops_dir / crop_name
                 crop_meta: Dict[str, Any]
                 if crop_path.exists() and not overwrite:
                     crop = cv2.imread(str(crop_path))
@@ -446,8 +594,8 @@ def detect_from_panos_stage(
                         "level_confidence": float(level_meta.get("confidence", 0.0) or 0.0),
                         "level_sample_count": int(level_meta.get("sample_count", 0) or 0),
                         "level_used_sample_count": int(level_meta.get("used_sample_count", 0) or 0),
-                        "R_level_applied": False,
                     }
+                    _augment_crop_meta(crop_meta, level_meta, R_level, level_method)
                     if crop is None:
                         crop, crop_meta = render_detection_crop(
                             pano_bgr=pano,
@@ -463,6 +611,7 @@ def detect_from_panos_stage(
                             roll_deg=0.0,
                             level_meta=level_meta,
                         )
+                        _augment_crop_meta(crop_meta, level_meta, R_level, level_method)
                         cv2.imwrite(str(crop_path), crop)
                 else:
                     crop, crop_meta = render_detection_crop(
@@ -479,6 +628,7 @@ def detect_from_panos_stage(
                         roll_deg=0.0,
                         level_meta=level_meta,
                     )
+                    _augment_crop_meta(crop_meta, level_meta, R_level, level_method)
                     cv2.imwrite(str(crop_path), crop)
                 total_crops += 1
 
@@ -526,7 +676,7 @@ def detect_from_panos_stage(
                         status="ok",
                         input_file=str(crop_path),
                         output_file=str(ann_path0),
-                        params={"fid": fid, "view": view_name, "s": step},
+                        params={"fid": fid, "view": view_name, "s": step, "level_method": str(level_method)},
                     )
                     break
 
@@ -606,6 +756,7 @@ def detect_from_panos_stage(
                         "fid": fid,
                         "view": view_name,
                         "s": step,
+                        "level_method": str(level_method),
                         "level_horizon": bool(cfg.level_horizon),
                         "level_min_confidence": float(cfg.level_min_confidence),
                     },
@@ -657,7 +808,7 @@ def detect_from_panos_stage(
             step="detect_pano_done",
             status="ok",
             input_file=str(pano_path),
-            params={"fid": fid, "level_horizon": bool(cfg.level_horizon)},
+            params={"fid": fid, "level_method": str(level_method), "level_horizon": bool(cfg.level_horizon)},
             level_meta=level_meta,
             confirmed=pano_confirmed,
             candidate=pano_candidate,
@@ -684,6 +835,7 @@ def detect_from_panos_stage(
             "level_preview_fov": float(cfg.level_preview_fov),
             "level_preview_w": int(cfg.level_preview_w),
             "level_preview_h": int(cfg.level_preview_h),
+            "level_method": str(level_method),
             "weights": weights,
             "conf": float(conf),
             "imgsz": int(imgsz),
@@ -692,7 +844,7 @@ def detect_from_panos_stage(
             "image_base": image_base,
         },
         "paths": {
-            "crops": str(crops_dir),
+            "crops": str(effective_crops_dir),
             "annotated": str(annotated_dir),
             "refine_compare": str(compare_dir),
             "detections": str(detections_jsonl),
@@ -712,6 +864,7 @@ def detect_from_panos_stage(
             "conf": conf,
             "imgsz": imgsz,
             "device": device,
+            "level_method": str(level_method),
             "level_horizon": bool(cfg.level_horizon),
             "level_min_confidence": float(cfg.level_min_confidence),
         },

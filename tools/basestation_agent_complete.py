@@ -53,9 +53,16 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--crop_height", type=int, default=1280)
     ap.add_argument("--level_method", choices=["none", "spherical_ransac"], default="none")
     ap.add_argument("--level_min_confidence", type=float, default=0.25)
+    ap.add_argument("--level_debug", action="store_true")
+    ap.add_argument("--level_preview_pitch", type=float, default=0.0)
     ap.add_argument("--level_preview_fov", type=float, default=90.0)
-    ap.add_argument("--level_preview_w", type=int, default=768)
+    ap.add_argument("--level_preview_w", type=int, default=1024)
     ap.add_argument("--level_preview_h", type=int, default=768)
+    ap.add_argument("--level_ransac_iters", type=int, default=1000)
+    ap.add_argument("--level_residual_thresh_deg", type=float, default=3.0)
+    ap.add_argument("--level_min_inliers", type=int, default=8)
+    ap.add_argument("--level_min_total_lines", type=int, default=20)
+    ap.add_argument("--level_max_apply_deg", type=float, default=5.0)
 
     ap.add_argument("--conf", type=float, default=0.20)
     ap.add_argument("--imgsz", type=int, default=1280)
@@ -83,6 +90,7 @@ def main() -> None:
     panos_dir = Path(args.panos_dir) if args.panos_dir else (run_dir / "panos")
     ordered_index = Path(args.ordered_index) if args.ordered_index else (run_dir / "aoi_index.jsonl")
     crops_dir = Path(args.crops_dir) if args.crops_dir else (run_dir / "crops")
+    effective_crops_dir = crops_dir if args.level_method == "none" else (crops_dir.parent / f"{crops_dir.name}_{args.level_method}")
 
     points_geojson = run_dir / "panoramax_points_in_aoi.geojson"
     annotated_dir = run_dir / "annotated"
@@ -129,7 +137,7 @@ def main() -> None:
             "images_jsonl": str(images_jsonl),
             "panos_dir": str(panos_dir),
             "ordered_index": str(ordered_index),
-            "crops_dir": str(crops_dir),
+            "crops_dir": str(effective_crops_dir),
             "annotated_dir": str(annotated_dir),
             "compare_dir": str(compare_dir),
             "yaw_map": str(yaw_map_path),
@@ -204,9 +212,16 @@ def main() -> None:
             log_path=log_path,
             level_method=args.level_method,
             level_min_confidence=args.level_min_confidence,
+            level_debug=args.level_debug,
+            level_preview_pitch=args.level_preview_pitch,
             level_preview_fov=args.level_preview_fov,
             level_preview_w=args.level_preview_w,
             level_preview_h=args.level_preview_h,
+            level_ransac_iters=args.level_ransac_iters,
+            level_residual_thresh_deg=args.level_residual_thresh_deg,
+            level_min_inliers=args.level_min_inliers,
+            level_min_total_lines=args.level_min_total_lines,
+            level_max_apply_deg=args.level_max_apply_deg,
         )
 
     if do_detect:
@@ -217,7 +232,7 @@ def main() -> None:
         )
         if use_existing_crops_only:
             summary["stages"]["detect"] = detect_existing_crops_stage(
-                crops_dir=crops_dir,
+                crops_dir=effective_crops_dir,
                 annotated_dir=annotated_dir,
                 detections_jsonl=detections_jsonl,
                 weights=args.weights,
@@ -253,10 +268,17 @@ def main() -> None:
                 overwrite=args.overwrite,
                 log_path=log_path,
                 level_method=args.level_method,
+                level_debug=args.level_debug,
+                level_preview_pitch=args.level_preview_pitch,
                 level_min_confidence=args.level_min_confidence,
                 level_preview_fov=args.level_preview_fov,
                 level_preview_w=args.level_preview_w,
                 level_preview_h=args.level_preview_h,
+                level_ransac_iters=args.level_ransac_iters,
+                level_residual_thresh_deg=args.level_residual_thresh_deg,
+                level_min_inliers=args.level_min_inliers,
+                level_min_total_lines=args.level_min_total_lines,
+                level_max_apply_deg=args.level_max_apply_deg,
             )
 
     detection_rows = read_jsonl(detections_jsonl) if detections_jsonl.exists() else []
